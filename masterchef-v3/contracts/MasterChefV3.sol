@@ -20,9 +20,13 @@ interface IERC20Mintable is IERC20 {
     function mint(address recipient_, uint256 amount_) external returns (bool);
 }
 
+/// @title MasterChefV3
+/// @notice V3 farming hub: holds position NFTs, coordinates with `ILMPool` for reward growth, and mints reward tokens per pool configuration.
+/// @dev Uses `rewardGrowthInside` snapshots per tokenId plus `boostLiquidity` for boosted emissions; not a Uniswap V2 LP MasterChef.
 contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, ReentrancyGuard, Enumerable {
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
+    /// @notice Farm pool metadata: links one V3 pool to allocation weight and optional multi-token reward mint targets.
     struct PoolInfo {
         uint256 allocPoint;
         // V3 pool address
@@ -42,6 +46,7 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         address[] rewardsAddresses;
     }
 
+    /// @notice Per-NFT staking state: mirrors NPM liquidity plus boosted LM liquidity for `rewardGrowthInside` delta math.
     struct UserPositionInfo {
         uint128 liquidity;
         uint128 boostLiquidity;
@@ -327,7 +332,7 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         uint128 liquidity;
     }
 
-    /// @notice Upon receiving a ERC721
+    /// @notice ERC721 callback: user stakes a V3 position NFT; we register ticks, sync LM stake, and snapshot `rewardGrowthInside`.
     function onERC721Received(
         address,
         address _from,

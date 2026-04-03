@@ -6,10 +6,9 @@ import '@pancakeswap/v3-periphery/contracts/interfaces/INonfungiblePositionManag
 
 import './PancakeV3LmPool.sol';
 
-/// @dev This contract is for Master Chef to create a corresponding LmPool when
-/// adding a new farming pool. As for why not just create LmPool inside the
-/// Master Chef contract is merely due to the imcompatibility of the solidity
-/// versions.
+/// @title PancakeV3LmPoolDeployer
+/// @notice Deploys one `PancakeV3LmPool` per V3 pool when MasterChef registers a farm, then wires it on the core factory via `setLmPool`.
+/// @dev Kept separate from MasterChef because Solidity 0.7 (LM pool) and 0.8 (MasterChef) cannot live in one contract cleanly.
 contract PancakeV3LmPoolDeployer {
     address public immutable masterChef;
 
@@ -22,8 +21,8 @@ contract PancakeV3LmPoolDeployer {
         masterChef = _masterChef;
     }
 
-    /// @dev Deploys a LmPool
-    /// @param pool The contract address of the PancakeSwap V3 pool
+    /// @notice Deploys a new LM pool and registers it on `PancakeV3Factory` so the canonical pool invokes LM hooks during swaps.
+    /// @param pool The V3 pool that will own this LM ledger
     function deploy(IPancakeV3Pool pool) external onlyMasterChef returns (IPancakeV3LmPool lmPool) {
         lmPool = new PancakeV3LmPool(address(pool), masterChef, uint32(block.timestamp));
         IPancakeV3Factory(INonfungiblePositionManager(IMasterChefV3(masterChef).nonfungiblePositionManager()).factory()).setLmPool(address(pool), address(lmPool));

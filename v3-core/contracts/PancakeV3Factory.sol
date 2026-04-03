@@ -123,6 +123,8 @@ contract PancakeV3Factory is IPancakeV3Factory {
         emit FeeAmountExtraInfoUpdated(fee, whitelistRequested, enabled);
     }
 
+    /// @inheritdoc IPancakeV3Factory
+    /// @notice Authorizes the deployer contract allowed to call `setLmPool` (besides the owner), typically `PancakeV3LmPoolDeployer`.
     function setLmPoolDeployer(address _lmPoolDeployer) external override onlyOwner {
         lmPoolDeployer = _lmPoolDeployer;
         emit SetLmPoolDeployer(_lmPoolDeployer);
@@ -141,6 +143,8 @@ contract PancakeV3Factory is IPancakeV3Factory {
         return IPancakeV3Pool(pool).collectProtocol(recipient, amount0Requested, amount1Requested);
     }
 
+    /// @inheritdoc IPancakeV3Factory
+    /// @notice Binds the LM pool on the canonical V3 pool so swaps can update farming rewards; only owner or `lmPoolDeployer`.
     function setLmPool(address pool, address lmPool) external override onlyOwnerOrLmPoolDeployer {
         IPancakeV3Pool(pool).setLmPool(lmPool);
     }

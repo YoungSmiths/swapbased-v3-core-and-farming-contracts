@@ -102,9 +102,11 @@ contract PancakeV3Pool is IPancakeV3Pool {
     /// @inheritdoc IPancakeV3PoolState
     Oracle.Observation[65535] public override observations;
 
-    // liquidity mining
+    /// @notice Optional liquidity-mining sidecar: tracks reward growth per liquidity and LM tick state.
+    /// @dev Updated only via `setLmPool` from the factory. When set, `swap` accrues rewards and crosses LM ticks in lockstep with the AMM.
     IPancakeV3LmPool public lmPool;
 
+    /// @notice Emitted when the factory binds or changes the LM pool address.
     event SetLmPoolEvent(address addr);
 
     /// @dev Mutually exclusive reentrancy protection into the pool to/from a method. This method also prevents entrance
@@ -644,6 +646,7 @@ contract PancakeV3Pool is IPancakeV3Pool {
             computedLatestObservation: false
         });
 
+        // LM: accrue emission to rewardGrowthGlobal before any price/tick movement in this swap.
         if (address(lmPool) != address(0)) {
           lmPool.accumulateReward(cache.blockTimestamp);
         }
@@ -730,6 +733,7 @@ contract PancakeV3Pool is IPancakeV3Pool {
                         cache.computedLatestObservation = true;
                     }
 
+                    // LM: mirror pool tick crossing so staked liquidity in-range matches active LM liquidity.
                     if (address(lmPool) != address(0)) {
                       lmPool.crossLmTick(step.tickNext, zeroForOne);
                     }
@@ -899,6 +903,8 @@ contract PancakeV3Pool is IPancakeV3Pool {
         emit CollectProtocol(msg.sender, recipient, amount0, amount1);
     }
 
+    /// @inheritdoc IPancakeV3PoolOwnerActions
+    /// @notice Binds the LM pool used for farming reward accounting; callable only by the factory or factory owner.
     function setLmPool(address _lmPool) external override onlyFactoryOrFactoryOwner {
       lmPool = IPancakeV3LmPool(_lmPool);
       emit SetLmPoolEvent(address(_lmPool));
