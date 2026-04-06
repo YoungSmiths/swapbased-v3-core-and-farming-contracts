@@ -169,6 +169,8 @@ contract PancakeV3Pool is IPancakeV3Pool {
     }
 
     /// @inheritdoc IPancakeV3PoolDerivedState
+    /// @notice 返回某一价格区间「内部」的累计 tick、每秒流动性倒数、时间，用于**区间型**奖励或分析（与全池 `observe` 互补）。
+    /// 例：某激励合约只统计 tick 在 [a,b) 内停留的流动性，可结合本函数与区间 LP 持仓做分配（具体积分方案在合约外实现）。
     function snapshotCumulativesInside(int24 tickLower, int24 tickUpper)
         external
         view
@@ -245,6 +247,8 @@ contract PancakeV3Pool is IPancakeV3Pool {
     }
 
     /// @inheritdoc IPancakeV3PoolDerivedState
+    /// @notice 按时间窗口查询预言机累计量，用于链下/链上构造 **TWAP**（时间加权价格）。`secondsAgos` 如 `[300,0]` 表示 5 分钟前与当前快照的差分可算近期均价。
+    /// 例：预言机合约读取 `[3600, 0]` 的 tick 累计差除以时间差，得到过去 1 小时平均价格，供借贷清算或期权结算使用。
     function observe(uint32[] calldata secondsAgos)
         external
         view
@@ -263,6 +267,8 @@ contract PancakeV3Pool is IPancakeV3Pool {
     }
 
     /// @inheritdoc IPancakeV3PoolActions
+    /// @notice 增大预言机环形缓冲区「下一步」容量，便于保存更长历史，从而支持更长窗口的 TWAP（gas 随 cardinality 增加）。
+    /// 例：若计划用 24 小时 TWAP，需保证观测点密度与 `cardinality` 足够，否则 `observe` 在久远时刻会不可用。
     function increaseObservationCardinalityNext(uint16 observationCardinalityNext)
         external
         override
@@ -279,7 +285,10 @@ contract PancakeV3Pool is IPancakeV3Pool {
     }
 
     /// @inheritdoc IPancakeV3PoolActions
+    /// @notice 池子部署后**首次**设定价格与 tick；在此之前 `swap`/`mint` 等会依赖未初始化的 `slot0` 而失败。
     /// @dev not locked because it initializes unlocked
+    /// @dev 典型场景：Factory 创建 USDT/WBNB 池后，用当前链上汇率对应的 `sqrtPriceX96` 初始化，使第一笔交易有明确起点。
+    /// 例：若希望初始价格约等于「1 WBNB = 300 USDT」且 token0=USDT、token1=WBNB，则需把该汇率换算为 `sqrtPriceX96` 后传入（具体换算见 `TickMath`/`SqrtPriceMath` 文档与前端/SDK）。
     function initialize(uint160 sqrtPriceX96) external override {
         require(slot0.sqrtPriceX96 == 0, 'AI');
 
@@ -320,7 +329,8 @@ contract PancakeV3Pool is IPancakeV3Pool {
         int128 liquidityDelta;
     }
 
-    /// @dev Effect some changes to a position
+    /// @dev 根据当前价与区间位置，计算并记账流动性变动所需的 token0/token1 数量（或反向应付）。
+    /// 形象理解：在「价格刻度尺」上，若现价在区间**下方**，区间里主要是 token1 一侧，加流动性要先补 token0（或减流动性时池子退 token0）——本函数三种分支对应现价在区间下/内/上。
     /// @param params the position details and the change to the position's liquidity to effect
     /// @return position a storage pointer referencing the position with the given owner and tick range
     /// @return amount0 the amount of token0 owed to the pool, negative if the pool should pay the recipient
@@ -392,7 +402,8 @@ contract PancakeV3Pool is IPancakeV3Pool {
         }
     }
 
-    /// @dev Gets and updates a position with the given liquidity delta
+    /// @dev 更新仓位与上下界 tick 的流动性、feeGrowth 与位图；跨 tick 时翻转 bitmap，并在减仓导致 tick 空置时 `clear`。
+    /// 形象理解：在 `tickLower`/`tickUpper` 两颗「钉子」上挂/卸流动性；`getFeeGrowthInside` 把全局手续费拆成区间内的增长，再写入仓位，后续 `collect` 才能领手续费。
     /// @param owner the owner of the position
     /// @param tickLower the lower tick of the position's tick range
     /// @param tickUpper the upper tick of the position's tick range
@@ -478,7 +489,9 @@ contract PancakeV3Pool is IPancakeV3Pool {
     }
 
     /// @inheritdoc IPancakeV3PoolActions
+    /// @notice 在 `[tickLower, tickUpper)` 区间**增加**流动性 `amount`（流动性单位，非代币个数）；随后通过 `pancakeV3MintCallback` 要求调用方转入应付的 token0/token1。
     /// @dev noDelegateCall is applied indirectly via _modifyPosition
+    /// 例：在 WBNB/USDT 池（假设 fee=2500 即 0.25%）中，LP 选 tick 对应价格带 $200–$400，当现价落在该区间内时，会同时消耗 USDT 与 WBNB；若现价在区间一侧，可能主要消耗单侧代币（与 Uniswap V3 行为一致）。
     function mint(
         address recipient,
         int24 tickLower,
@@ -511,6 +524,8 @@ contract PancakeV3Pool is IPancakeV3Pool {
     }
 
     /// @inheritdoc IPancakeV3PoolActions
+    /// @notice 将本仓位已累积的**手续费欠款**（`tokensOwed0/1`）转出到 `recipient`；请求额超过欠款时按实际欠款支付。
+    /// 例：`burn` 后未立即 `collect`，或做市期间手续费持续计入 `tokensOwed`，调用 `collect` 可把例如 100 USDT + 0.05 WBNB 领到钱包（具体数额以仓位状态为准）。
     function collect(
         address recipient,
         int24 tickLower,
@@ -537,7 +552,9 @@ contract PancakeV3Pool is IPancakeV3Pool {
     }
 
     /// @inheritdoc IPancakeV3PoolActions
+    /// @notice **减少**区间流动性；本金对应的 token0/token1 先记入 `tokensOwed`，需再调 `collect` 才真正转出。
     /// @dev noDelegateCall is applied indirectly via _modifyPosition
+    /// 例：当初 `mint` 了 1e18 流动性单位，现 `burn` 一半；返回的 amount0/amount1 为应退还数量，链上常见流程为 `burn` → `collect` 一步完成提现。
     function burn(
         int24 tickLower,
         int24 tickUpper,
@@ -616,6 +633,10 @@ contract PancakeV3Pool is IPancakeV3Pool {
     }
 
     /// @inheritdoc IPancakeV3PoolActions
+    /// @notice 沿曲线交换：推动现价至 `sqrtPriceLimitX96`（或用完指定量）；`amountSpecified > 0` 表示**精确输入**（输入 asset 的 wei 数），`< 0` 表示**精确输出**。
+    /// @dev `zeroForOne==true` 表示用 token0 换 token1，价格 √(P) 下降；反之用 token1 换 token0，√(P) 上升。跨初始化 tick 时会更新区间内流动性并累计手续费/预言机。
+    /// 例（精确输入）：池子为 USDT(token0)/WBNB(token1)，用户想花 **1000 USDT** 买 WBNB：设 `zeroForOne=true`，`amountSpecified=1000*10**18`（假设 18 位），`sqrtPriceLimitX96` 设为允许的最差成交价对应的平方根下限（滑点保护）。
+    /// 例（精确输出）：希望刚好收到 **0.5 WBNB**，可用 `amountSpecified` 为负、`zeroForOne=false`，并由回调支付所需 USDT（具体以 Router 封装为准）。
     function swap(
         address recipient,
         bool zeroForOne,
@@ -823,6 +844,8 @@ contract PancakeV3Pool is IPancakeV3Pool {
     }
 
     /// @inheritdoc IPancakeV3PoolActions
+    /// @notice 无抵押借出 `amount0/amount1` 给 `recipient`，在同一交易内回调 `pancakeV3FlashCallback`，归还本金 + 按池子 `fee`（1e6 分母）计算的手续费；否则交易回滚。
+    /// 例：套利合约在同一笔 tx 中借 100 万 USDT → 在外部 DEX 搬砖 → 还回池子 100 万 + fee；若余额不足则 `F0`/`F1` 失败。手续费按当前流动性参与 `feeGrowthGlobal` 分配。
     function flash(
         address recipient,
         uint256 amount0,
@@ -869,6 +892,8 @@ contract PancakeV3Pool is IPancakeV3Pool {
     }
 
     /// @inheritdoc IPancakeV3PoolOwnerActions
+    /// @notice 设置**协议费**占交易费的比例（每侧独立，单位见 `PROTOCOL_FEE_DENOMINATOR=10000`）；与 LP 手续费分成，累积在 `protocolFees` 中由 `collectProtocol` 提取。
+    /// 例：`feeProtocol0=1000` 表示输入侧为 token0 时，从该笔交易费中再切 10% 给协议（具体以池内实现与注释为准），用于国库或生态激励。
     function setFeeProtocol(uint32 feeProtocol0, uint32 feeProtocol1) external override lock onlyFactoryOrFactoryOwner {
         require(
             (feeProtocol0 == 0 || (feeProtocol0 >= 1000 && feeProtocol0 <= 4000)) &&
@@ -881,6 +906,8 @@ contract PancakeV3Pool is IPancakeV3Pool {
     }
 
     /// @inheritdoc IPancakeV3PoolOwnerActions
+    /// @notice 将累积的协议费代币转给 `recipient`（Factory 或 owner 权限）；与 LP 的 `collect` 不同，这里只动 `protocolFees`。
+    /// 例：国库多签定期调用，一次提走 5000 USDT 与 2 WBNB 累积（数额以链上 `protocolFees` 为准）。
     function collectProtocol(
         address recipient,
         uint128 amount0Requested,
@@ -904,7 +931,8 @@ contract PancakeV3Pool is IPancakeV3Pool {
     }
 
     /// @inheritdoc IPancakeV3PoolOwnerActions
-    /// @notice Binds the LM pool used for farming reward accounting; callable only by the factory or factory owner.
+    /// @notice 绑定流动性挖矿侧车合约 `lmPool`：`swap` 时同步累计挖矿奖励、跨 tick 时调用 `crossLmTick`，使农场奖励与池内活跃流动性一致。
+    /// 例：Farm 上线某 USDT/WBNB 池前，Factory 设置 `lmPool` 地址；用户在该池交易时，质押在农场的 LP 按比例获得 CAKE 类奖励（具体规则在 `lmPool` 合约中）。
     function setLmPool(address _lmPool) external override onlyFactoryOrFactoryOwner {
       lmPool = IPancakeV3LmPool(_lmPool);
       emit SetLmPoolEvent(address(_lmPool));

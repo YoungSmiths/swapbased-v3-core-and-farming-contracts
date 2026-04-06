@@ -152,7 +152,7 @@ Owner 还可通过 `enableFeeAmount` 新增档位；部分档位可配置白名�
 
 - `**rewardGrowthGlobalX128`**：全局每单位流动性的奖励累计（类比 feeGrowth）。  
 - `**lmTicks` + `LmTick` 库**：维护每个 tick 上的 **liquidityGross / liquidityNet / rewardGrowthOutside**，从而能算 `**getRewardGrowthInside(lower, upper)`**。  
-- `**updatePosition**`：仅允许 **MasterChef** 调用，在用户质押/调整/boost 时，对 `[tickLower, tickUpper)` 更新 **boost 后的有效流动性**（`liquidityDelta`）。
+- `**updatePosition`**：仅允许 **MasterChef** 调用，在用户质押/调整/boost 时，对 `[tickLower, tickUpper)` 更新 **boost 后的有效流动性**（`liquidityDelta`）。
 
 ### 4.3 为何单独 `PancakeV3LmPoolDeployer`？授权链是什么？
 
@@ -160,8 +160,8 @@ Solidity 版本不兼容时，把 **部署 LmPool** 与 **回写 Pool** 拆到�
 
 1. **MasterChef** `add` 新矿池时调用 `**ILMPoolDeployer.deploy(v3Pool)`**（实现类即 `PancakeV3LmPoolDeployer`）。
 2. **Deployer** `onlyMasterChef`：`new PancakeV3LmPool(pool, masterChef, ...)`，随后调用 `**PancakeV3Factory.setLmPool(pool, lmPool)`**。
-3. **Factory** `setLmPool` 使用修饰符 `**onlyOwnerOrLmPoolDeployer`**：仅 **工厂 owner** 或 **已登记的 `lmPoolDeployer` 地址** 可调用。因此普通用户**不能**把任意合约绑到任意池上。
-4. Factory 内部再调 `**PancakeV3Pool.setLmPool(lmPool)`**；Pool 侧为 `**onlyFactoryOrFactoryOwner**`，即只有 Factory 或 Factory owner 能改 `lmPool` 指针。
+3. **Factory** `setLmPool` 使用修饰符 `**onlyOwnerOrLmPoolDeployer`**：仅 工厂 owner 或 已登记的 `lmPoolDeployer` 地址 可调用。因此普通用户**不能**把任意合约绑到任意池上。
+4. Factory 内部再调 `**PancakeV3Pool.setLmPool(lmPool)`**；Pool 侧为 `**onlyFactoryOrFactoryOwner`**，即只有 Factory 或 Factory owner 能改 `lmPool` 指针。
 
 **面试一句话**：恶意 LM 无法随意绑定，除非攻破工厂 owner、或冒充已注册的 lmPoolDeployer、或 Factory owner 作恶。
 
@@ -207,7 +207,7 @@ Solidity 版本不兼容时，把 **部署 LmPool** 与 **回写 Pool** 拆到�
 ### 6.1 NonfungiblePositionManager（NPM）
 
 - 把 `(token0, token1, fee, tickLower, tickUpper)` 头寸封装成 **ERC721**。  
-- 用户与池子的 `mint`/`swap` 通过 **callback** 完成代币交割（`pancakeV3MintCallback` / `pancakeV3SwapCallback` 命名与 Uniswap 的 `uniswapV3*` 对应，属品牌命名差异）。
+- 用户与池子的 `mint`/`swap` 通过 **callback** 完成代币交割（`pancakeV3MintCallback` / `pancakeV3SwapCallback` 命名与 Uniswap 的 `uniswapV3`* 对应，属品牌命名差异）。
 
 ### 6.2 SwapRouter（v3-periphery）
 

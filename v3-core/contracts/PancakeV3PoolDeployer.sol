@@ -6,6 +6,8 @@ import './interfaces/IPancakeV3PoolDeployer.sol';
 import './PancakeV3Pool.sol';
 
 contract PancakeV3PoolDeployer is IPancakeV3PoolDeployer {
+    // 参数集合：用于在部署 PancakeV3Pool 时临时保存所需参数，部署完成后清除。
+    // 示例：在调用 deploy 时，将 factory/token0/token1/fee/tickSpacing 写入该结构，之后通过 salt 生成合约地址并完成部署。
     struct Parameters {
         address factory;
         address token0;
@@ -19,7 +21,8 @@ contract PancakeV3PoolDeployer is IPancakeV3PoolDeployer {
 
     address public factoryAddress;
 
-    /// @notice Emitted when factory address is set
+    /// @notice Factory address set by setFactoryAddress
+    /// @dev Initializes the deployer with the authoritative factory address. Once set, it cannot be changed.
     event SetFactoryAddress(address indexed factory);
 
     modifier onlyFactory() {
@@ -35,13 +38,12 @@ contract PancakeV3PoolDeployer is IPancakeV3PoolDeployer {
         emit SetFactoryAddress(_factoryAddress);
     }
 
-    /// @dev Deploys a pool with the given parameters by transiently setting the parameters storage slot and then
-    /// clearing it after deploying the pool.
-    /// @param factory The contract address of the PancakeSwap V3 factory
-    /// @param token0 The first token of the pool by address sort order
-    /// @param token1 The second token of the pool by address sort order
-    /// @param fee The fee collected upon every swap in the pool, denominated in hundredths of a bip
-    /// @param tickSpacing The spacing between usable ticks
+    /// @dev 部署一个池子，过程为：在参数存储中临时写入参数，然后通过盐创建 PancakeV3Pool 实例，部署完成后清空参数存储。
+    /// @param factory PancakeSwap V3 工厂合约地址
+    /// @param token0 按地址排序的第一个代币地址
+    /// @param token1 按地址排序的第二个代币地址
+    /// @param fee 池子交易费率，单位为百分之一百比（bps 的单位，示例：3000 表示 0.30%）
+    /// @param tickSpacing 可用刻度之间的间距
     function deploy(
         address factory,
         address token0,
