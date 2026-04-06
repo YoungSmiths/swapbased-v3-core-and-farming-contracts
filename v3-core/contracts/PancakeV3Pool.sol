@@ -27,6 +27,16 @@ import './interfaces/callback/IPancakeV3FlashCallback.sol';
 
 import '@pancakeswap/v3-lm-pool/contracts/interfaces/IPancakeV3LmPool.sol';
 
+/// @title PancakeV3Pool —— 单交易对、单费率档下的 **集中流动性 AMM 核心状态机**
+/// @notice 每个池对应 **固定** `token0 < token1` 与 `fee/tickSpacing`（构造函数从 `PancakeV3PoolDeployer.parameters()` 读入）。对外核心能力：**`initialize` 定价**、**`mint`/`burn` 管理区间流动性**、**`swap` 换币**、**`flash` 闪电贷**、**`collect` 领 LP 手续费**。
+///
+/// **与 Factory / Deployer 的关系**：池由 **`PancakeV3Factory.createPool` → PoolDeployer.deploy** 创建；创建后 `slot0.sqrtPriceX96==0`，必须 **`initialize`** 后 `mint`/`swap` 才可用。
+///
+/// **与外围 NPM 的关系**：用户不直接持有「池内 position」的友好接口在 **`NonfungiblePositionManager`**；NPM 调本合约 **`mint(recipient=NPM, ...)`**，通过 **`pancakeV3MintCallback`** 收款。`positions[owner][tickLower][tickUpper]` 的 `owner` 常为 NPM 地址。
+///
+/// **本仓库增量**：可选 **`lmPool`**；`swap` 内 **`accumulateReward` / `crossLmTick`** 与主池跨 tick 同步，供 MasterChef 农场累计奖励（详见 README）。
+///
+/// **状态要点**：`slot0` 存现价与 tick；`feeGrowthGlobal0/1` 累计全池手续费；`ticks`/`tickBitmap` 管理离散价格；`positions` 记每用户每区间的流动性与费用欠款；`observations` 供 TWAP。
 contract PancakeV3Pool is IPancakeV3Pool {
     using LowGasSafeMath for uint256;
     using LowGasSafeMath for int256;
@@ -39,40 +49,39 @@ contract PancakeV3Pool is IPancakeV3Pool {
     using Oracle for Oracle.Observation[65535];
 
     /// @inheritdoc IPancakeV3PoolImmutables
+    /// @notice 创建本池的 Factory；`onlyFactoryOrFactoryOwner` 鉴权用。
     address public immutable override factory;
     /// @inheritdoc IPancakeV3PoolImmutables
+    /// @notice 排序后较小地址侧代币。
     address public immutable override token0;
     /// @inheritdoc IPancakeV3PoolImmutables
+    /// @notice 排序后较大地址侧代币。
     address public immutable override token1;
     /// @inheritdoc IPancakeV3PoolImmutables
+    /// @notice 池费率（如 500；swap 手续费计算见 `SwapMath`，分母 1e6）。
     uint24 public immutable override fee;
 
     /// @inheritdoc IPancakeV3PoolImmutables
+    /// @notice 允许的 tick 间距；与 `tickBitmap` 寻址相关。
     int24 public immutable override tickSpacing;
 
     /// @inheritdoc IPancakeV3PoolImmutables
+    /// @notice 单 tick 上允许的最大流动性上界（防溢出）。
     uint128 public immutable override maxLiquidityPerTick;
 
     uint32  internal constant PROTOCOL_FEE_SP = 65536;
 
     uint256 internal constant PROTOCOL_FEE_DENOMINATOR = 10000;
 
+    /// @notice 池核心快照（打包存储）；`swap`/`mint` 等会读写其中现价、预言机索引与 **重入锁 `unlocked`**。
     struct Slot0 {
-        // the current price
-        uint160 sqrtPriceX96;
-        // the current tick
-        int24 tick;
-        // the most-recently updated index of the observations array
-        uint16 observationIndex;
-        // the current maximum number of observations that are being stored
-        uint16 observationCardinality;
-        // the next maximum number of observations to store, triggered in observations.write
-        uint16 observationCardinalityNext;
-        // the current protocol fee for token0 and token1,
-        // 2 uint32 values store in a uint32 variable (fee/PROTOCOL_FEE_DENOMINATOR)
-        uint32 feeProtocol;
-        // whether the pool is locked
-        bool unlocked;
+        uint160 sqrtPriceX96; // 当前 √(price) 定点表示（×2^96），与 tick 一一对应
+        int24 tick; // 当前价格所在 tick
+        uint16 observationIndex; // 预言机环形数组当前写入下标
+        uint16 observationCardinality; // 已用观测点个数（TWAP 历史长度相关）
+        uint16 observationCardinalityNext; // 可扩容上限；`increaseObservationCardinalityNext` 增大
+        uint32 feeProtocol; // 打包两枚 token 的协议费参数（低 16 位 token0，高 16 位 token1，见 `PROTOCOL_FEE_SP`）
+        bool unlocked; // `lock`：false 表示正处于 swap/mint 等互斥区，防重入
     }
     /// @inheritdoc IPancakeV3PoolState
     Slot0 public override slot0;
@@ -82,7 +91,7 @@ contract PancakeV3Pool is IPancakeV3Pool {
     /// @inheritdoc IPancakeV3PoolState
     uint256 public override feeGrowthGlobal1X128;
 
-    // accumulated protocol fees in token0/token1 units
+    /// @notice 协议从交易费中切给国库、尚未 `collectProtocol` 提走的累计余额。
     struct ProtocolFees {
         uint128 token0;
         uint128 token1;
@@ -109,9 +118,8 @@ contract PancakeV3Pool is IPancakeV3Pool {
     /// @notice Emitted when the factory binds or changes the LM pool address.
     event SetLmPoolEvent(address addr);
 
-    /// @dev Mutually exclusive reentrancy protection into the pool to/from a method. This method also prevents entrance
-    /// to a function before the pool is initialized. The reentrancy guard is required throughout the contract because
-    /// we use balance checks to determine the payment status of interactions such as mint, swap and flash.
+    /// @notice 互斥锁：`unlocked==false` 时拒绝进入（防嵌套调用）。`swap` 自行管理锁因回调付款逻辑不同。
+    /// @dev 未 `initialize` 时 `slot0` 默认 `unlocked` 为 false，故会先触发 `LOK`。
     modifier lock() {
         require(slot0.unlocked, 'LOK');
         slot0.unlocked = false;
@@ -119,13 +127,13 @@ contract PancakeV3Pool is IPancakeV3Pool {
         slot0.unlocked = true;
     }
 
-    /// @dev Prevents calling a function from anyone except the factory or its
-    /// owner
+    /// @notice 仅 Factory 合约或 Factory.owner 可改协议费、提协议费、`setLmPool`。
     modifier onlyFactoryOrFactoryOwner() {
         require(msg.sender == factory || msg.sender == IPancakeV3Factory(factory).owner());
         _;
     }
 
+    /// @notice 仅能通过 Deployer `new PancakeV3Pool{salt}` 创建；`msg.sender` 须为 Deployer，从中读取一次性 **immutable** 参数。
     constructor() {
         int24 _tickSpacing;
         (factory, token0, token1, fee, _tickSpacing) = IPancakeV3PoolDeployer(msg.sender).parameters();
@@ -319,13 +327,11 @@ contract PancakeV3Pool is IPancakeV3Pool {
         emit Initialize(sqrtPriceX96, tick);
     }
 
+    /// @notice `_modifyPosition` 入参：`liquidityDelta>0` 为加流动性，`<0` 为减。
     struct ModifyPositionParams {
-        // the address that owns the position
-        address owner;
-        // the lower and upper tick of the position
+        address owner; // 池内 position 主：NPM 加池时为 NPM 合约地址
         int24 tickLower;
         int24 tickUpper;
-        // any change in liquidity
         int128 liquidityDelta;
     }
 
@@ -490,7 +496,9 @@ contract PancakeV3Pool is IPancakeV3Pool {
 
     /// @inheritdoc IPancakeV3PoolActions
     /// @notice 在 `[tickLower, tickUpper)` 区间**增加**流动性 `amount`（流动性单位，非代币个数）；随后通过 `pancakeV3MintCallback` 要求调用方转入应付的 token0/token1。
-    /// @dev noDelegateCall is applied indirectly via _modifyPosition
+    /// @param recipient 流动性归属地址（池内 `positions[recipient][...]`）；**NPM 加池时为 NPM 合约地址**。
+    /// @param data 透传给 **`msg.sender.pancakeV3MintCallback`**（NPM 传 MintCallbackData，用于 `pay`）。
+    /// @dev `msg.sender` 须为外围合约（如 NPM）；回调验款用余额差。详见 `LiquidityManagement`。
     /// 例：在 WBNB/USDT 池（假设 fee=2500 即 0.25%）中，LP 选 tick 对应价格带 $200–$400，当现价落在该区间内时，会同时消耗 USDT 与 WBNB；若现价在区间一侧，可能主要消耗单侧代币（与 Uniswap V3 行为一致）。
     function mint(
         address recipient,
@@ -524,7 +532,9 @@ contract PancakeV3Pool is IPancakeV3Pool {
     }
 
     /// @inheritdoc IPancakeV3PoolActions
-    /// @notice 将本仓位已累积的**手续费欠款**（`tokensOwed0/1`）转出到 `recipient`；请求额超过欠款时按实际欠款支付。
+    /// @notice 将 **`msg.sender` 在该 tick 区间仓位** 的 `tokensOwed0/1` 转给 `recipient`（通常为 NPM 再转用户）。
+    /// @param recipient 收款地址。
+    /// **注意**：`msg.sender` 必须是该 position 的 owner（与 `burn` 一致）；直接用户很少直调池子，多经 NPM。
     /// 例：`burn` 后未立即 `collect`，或做市期间手续费持续计入 `tokensOwed`，调用 `collect` 可把例如 100 USDT + 0.05 WBNB 领到钱包（具体数额以仓位状态为准）。
     function collect(
         address recipient,
@@ -552,8 +562,8 @@ contract PancakeV3Pool is IPancakeV3Pool {
     }
 
     /// @inheritdoc IPancakeV3PoolActions
-    /// @notice **减少**区间流动性；本金对应的 token0/token1 先记入 `tokensOwed`，需再调 `collect` 才真正转出。
-    /// @dev noDelegateCall is applied indirectly via _modifyPosition
+    /// @notice **减少** `msg.sender` 在该区间的流动性；退还代币先记入 **`tokensOwed`**，需再 **`collect`**。
+    /// @dev `msg.sender` 为 position owner（NPM 调时即 NPM）。
     /// 例：当初 `mint` 了 1e18 流动性单位，现 `burn` 一半；返回的 amount0/amount1 为应退还数量，链上常见流程为 `burn` → `collect` 一步完成提现。
     function burn(
         int24 tickLower,

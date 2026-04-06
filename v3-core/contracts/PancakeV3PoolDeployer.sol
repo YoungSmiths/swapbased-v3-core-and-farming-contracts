@@ -5,9 +5,14 @@ import './interfaces/IPancakeV3PoolDeployer.sol';
 
 import './PancakeV3Pool.sol';
 
+/// @title PancakeV3PoolDeployer —— 用 CREATE2 **确定性地址**部署单口 `PancakeV3Pool`
+/// @notice 与 Uniswap V3 同构：**池构造函数无参**，部署时在 `constructor()` 内通过 `IPancakeV3PoolDeployer(msg.sender).parameters()` 读取本合约临时写入的 `factory/token0/token1/fee/tickSpacing`，部署结束 `delete parameters`。
+///
+/// **为何单独 Deployer**：保证 `new PancakeV3Pool{salt: keccak256(token0,token1,fee)}` 与外围 **`PoolAddress.computeAddress(deployer, poolKey)`** 算出的地址一致，Router/NPM 可离线预测池地址。
+///
+/// **实例**：`createPool(USDT,WBNB,2500)` → Factory 调 `deploy(...)` → 新池部署完成 → 需再 **`initialize(sqrtPriceX96)`** 才能交易。
 contract PancakeV3PoolDeployer is IPancakeV3PoolDeployer {
-    // 参数集合：用于在部署 PancakeV3Pool 时临时保存所需参数，部署完成后清除。
-    // 示例：在调用 deploy 时，将 factory/token0/token1/fee/tickSpacing 写入该结构，之后通过 salt 生成合约地址并完成部署。
+    /// @notice 仅 `deploy` 执行期间有效；供 `PancakeV3Pool` 构造函数读取一次。
     struct Parameters {
         address factory;
         address token0;
@@ -19,10 +24,10 @@ contract PancakeV3PoolDeployer is IPancakeV3PoolDeployer {
     /// @inheritdoc IPancakeV3PoolDeployer
     Parameters public override parameters;
 
+    /// @notice 唯一有权调用 `deploy` 的 Factory；`setFactoryAddress` 仅允许设一次。
     address public factoryAddress;
 
-    /// @notice Factory address set by setFactoryAddress
-    /// @dev Initializes the deployer with the authoritative factory address. Once set, it cannot be changed.
+    /// @notice Factory 地址完成绑定时触发。
     event SetFactoryAddress(address indexed factory);
 
     modifier onlyFactory() {
@@ -30,6 +35,9 @@ contract PancakeV3PoolDeployer is IPancakeV3PoolDeployer {
         _;
     }
 
+    /// @notice 登记唯一 Factory；若已设置则 revert。
+    /// @param _factoryAddress `PancakeV3Factory` 地址。
+    /// **使用场景**：部署顺序一般为 Deployer → Factory(constructor 传入本 Deployer 地址) → **本函数**绑定 Factory → 之后仅该 Factory 可 `deploy`。
     function setFactoryAddress(address _factoryAddress) external {
         require(factoryAddress == address(0), "already initialized");
 
@@ -38,12 +46,15 @@ contract PancakeV3PoolDeployer is IPancakeV3PoolDeployer {
         emit SetFactoryAddress(_factoryAddress);
     }
 
-    /// @dev 部署一个池子，过程为：在参数存储中临时写入参数，然后通过盐创建 PancakeV3Pool 实例，部署完成后清空参数存储。
-    /// @param factory PancakeSwap V3 工厂合约地址
-    /// @param token0 按地址排序的第一个代币地址
-    /// @param token1 按地址排序的第二个代币地址
-    /// @param fee 池子交易费率，单位为百分之一百比（bps 的单位，示例：3000 表示 0.30%）
-    /// @param tickSpacing 可用刻度之间的间距
+    /// @notice 部署一口新池并返回其地址；**仅 Factory** 会调用（见 `onlyFactory`）。
+    /// @param factory Factory 自身地址（写入池子不可变 `factory`）
+    /// @param token0 已排序的小地址
+    /// @param token1 已排序的大地址
+    /// @param fee 费率档（须与 Factory 已启用的档位一致）
+    /// @param tickSpacing 该档对应的 tick 间距（Factory 从 `feeAmountTickSpacing[fee]` 传入）
+    /// @return pool 新部署的 `PancakeV3Pool` 地址（CREATE2，salt = `keccak256(abi.encode(token0, token1, fee))`）。
+    /// **核心逻辑**：`parameters` 临时赋值 → `new PancakeV3Pool{salt:...}` → `delete parameters`。
+    /// **部署后下一步**：池子 `sqrtPriceX96==0`，需 **`initialize(sqrtPriceX96)`**（通常由外围 `createAndInitializePoolIfNecessary` 或首笔初始化交易）后才能 `swap`/`mint`。
     function deploy(
         address factory,
         address token0,
@@ -51,8 +62,11 @@ contract PancakeV3PoolDeployer is IPancakeV3PoolDeployer {
         uint24 fee,
         int24 tickSpacing
     ) external override onlyFactory returns (address pool) {
+        // 写入临时存储，供即将创建的 PancakeV3Pool 构造函数读取
         parameters = Parameters({factory: factory, token0: token0, token1: token1, fee: fee, tickSpacing: tickSpacing});
+        // CREATE2：salt 仅含 (token0,token1,fee)，与 periphery PoolAddress 规则一致
         pool = address(new PancakeV3Pool{salt: keccak256(abi.encode(token0, token1, fee))}());
+        // 释放存储，避免下次 deploy 误用旧参数
         delete parameters;
     }
 }

@@ -9,19 +9,23 @@ import '../interfaces/external/IERC1271.sol';
 import '../interfaces/IERC721Permit.sol';
 import './BlockTimestamp.sol';
 
-/// @title ERC721 with permit
-/// @notice Nonfungible tokens that support an approve via signature, i.e. permit
+/// @title ERC721Permit —— 支持 EIP-2612 风格链下签名的 ERC721
+/// @notice 用户可离线签 `Permit(spender, tokenId, nonce, deadline)`，第三方代提交 `permit`，**无需先链上 `approve`**，适合与 `multicall` 组合。
+///
+/// **形象理解**：像 ERC20 的 permit，但授权对象是「某枚 NFT 给某 spender」；合约账户可用 ERC1271 `isValidSignature`。
 abstract contract ERC721Permit is BlockTimestamp, ERC721, IERC721Permit {
-    /// @dev Gets the current nonce for a token ID and then increments it, returning the original value
+    /// @notice 取该 `tokenId` 当前 nonce 并 +1（防签名重放）；子类实现（如 NPM 存在 `Position.nonce`）。
     function _getAndIncrementNonce(uint256 tokenId) internal virtual returns (uint256);
 
-    /// @dev The hash of the name used in the permit signature verification
+    /// @notice `DOMAIN_SEPARATOR` 里用的 name 的 keccak。
     bytes32 private immutable nameHash;
 
-    /// @dev The hash of the version string used in the permit signature verification
+    /// @notice `DOMAIN_SEPARATOR` 里用的 version 的 keccak（如 "1"）。
     bytes32 private immutable versionHash;
 
-    /// @notice Computes the nameHash and versionHash
+    /// @param name_ NFT 名称（如 Pancake V3 Positions NFT-V1）。
+    /// @param symbol_ 符号。
+    /// @param version_ EIP-712 版本字符串，参与 DOMAIN 分隔符。
     constructor(
         string memory name_,
         string memory symbol_,
@@ -31,6 +35,7 @@ abstract contract ERC721Permit is BlockTimestamp, ERC721, IERC721Permit {
         versionHash = keccak256(bytes(version_));
     }
 
+    /// @notice EIP-712 域分隔符（含 chainId、本合约地址），用于 `permit` 验签。
     /// @inheritdoc IERC721Permit
     function DOMAIN_SEPARATOR() public view override returns (bytes32) {
         return
@@ -46,11 +51,18 @@ abstract contract ERC721Permit is BlockTimestamp, ERC721, IERC721Permit {
             );
     }
 
+    /// @notice Permit 结构体类型哈希（spender、tokenId、nonce、deadline）。
     /// @inheritdoc IERC721Permit
-    /// @dev Value is equal to keccak256("Permit(address spender,uint256 tokenId,uint256 nonce,uint256 deadline)");
     bytes32 public constant override PERMIT_TYPEHASH =
         0x49ecf333e5b8c95c40fdafc95c1ad136e8914a8fb55e9dc8bb01eaa83a2df9ad;
 
+    /// @notice 用签名授权 `spender` 操作 `tokenId`（等价于 `approve`，但链下完成）。
+    /// @param spender 被授权地址（如 Router）。
+    /// @param tokenId 头寸 NFT id。
+    /// @param deadline 签名过期时间。
+    /// @param v, r, s ECDSA 或合约签名。
+    /// **核心逻辑**：验 `deadline` → 拼 digest → owner 为合约则 ERC1271，否则 `ecrecover` → `_approve`。
+    /// **使用场景**：聚合器代用户 `decreaseLiquidity` / `collect` 前先 `permit`。
     /// @inheritdoc IERC721Permit
     function permit(
         address spender,

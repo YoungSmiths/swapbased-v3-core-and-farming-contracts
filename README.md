@@ -107,6 +107,27 @@ Owner 还可通过 `enableFeeAmount` 新增档位；部分档位可配置白名�
 **为何 MasterChef 用 0.8 而 Core 用 0.7？**  
 部署器注释里写明：LM 部署与 MasterChef 逻辑若在旧版本里内联合约体积/编译约束更麻烦，故 **LmPool 由独立部署器在 0.7 环境部署**，MasterChef 用 0.8 享受更现代的语法与安全特性，通过接口交互即可。
 
+### 2.2 `v3-core` 与 `v3-lm-pool`：实现区别与「为何有两个 V3」
+
+仓库里 **`v3-core`** 与 **`v3-lm-pool`** 两个目录都带「V3」，**不是**两套并列的 AMM，而是 **同一套 V3 交易基础设施 + 一条可选的「挖矿侧车」**：
+
+| 维度 | `v3-core` | `v3-lm-pool` |
+| ---- | --------- | ------------ |
+| **核心合约** | `PancakeV3Factory`、`PancakeV3Pool` | `PancakeV3LmPool`（及 `LmTick` 等库） |
+| **解决什么问题** | **交易与做市**：价格 `sqrtPriceX96`、集中流动性、`swap` / `mint` / `burn`、LP **手续费** `feeGrowthGlobal` | **流动性挖矿记账**：排放奖励的 **`rewardGrowthGlobal`**、按 tick 维护 **挖矿侧**流动性与跨 tick 分账（与主池 tick 同步） |
+| **能否单独完成换币** | **能**（池子即 AMM） | **不能**。LmPool **不撮合**、不替代 Pool；只被 **`PancakeV3Pool` 在 `swap` 里**调用 `accumulateReward` / `crossLmTick`，以及被 **MasterChef** 调用 `updatePosition` |
+| **与谁绑定** | 工厂创建，一对 `(token0, token1, fee)` 一口池 | **一对一**挂在已存在的 `PancakeV3Pool` 上（`Pool.lmPool`；经 Factory `setLmPool` 授权绑定） |
+
+**一句话**：**`v3-core` = V3 本体（与 Uniswap V3 同构的交易核心）**；**`v3-lm-pool` = 挂在该池上的「农场排放/积分账本」**，用类似 `feeGrowth` 的思路把 **激励代币**按 **有效挖矿流动性**分下去。
+
+**为何要单独拆成 `v3-lm-pool`（而不是全写进 Pool）**：
+
+1. **职责分离**：交易与 LP 手续费属于 AMM 安全边界；挖矿是运营层（排放、boost、多奖励在 `masterchef-v3`）。拆开便于审计与迭代激励而不动核心数学。  
+2. **状态并行**：主池有 `ticks` / `feeGrowth*`；LmPool 有 `lmTicks` / `rewardGrowth*`，**跨 tick 与主池同步**，避免交易状态与排放状态缠在同一套结构里。  
+3. **部署与版本**：LmPool 由 **`PancakeV3LmPoolDeployer`** 等部署后再 `setLmPool`；与 MasterChef（常见 `0.8.x`）协同，而 Core 保持 `0.7.6`（见上一段）。
+
+**「两个 V3」易误解点**：目录名里的 V3 均指 **PancakeSwap V3 产品线的模块**，不是「第二个 V3 池」。用户**交易只经过 `v3-core` 的 Pool**；仅当该池绑定了 LmPool 时，**swap 会顺带更新挖矿累计**；未绑定时 `lmPool` 为零地址即可。
+
 ---
 
 ## 三、核心概念：集中流动性 AMM（与 Uniswap V3 对齐）
@@ -209,6 +230,8 @@ Solidity 版本不兼容时，把 **部署 LmPool** 与 **回写 Pool** 拆到�
 - 把 `(token0, token1, fee, tickLower, tickUpper)` 头寸封装成 **ERC721**。  
 - 用户与池子的 `mint`/`swap` 通过 **callback** 完成代币交割（`pancakeV3MintCallback` / `pancakeV3SwapCallback` 命名与 Uniswap 的 `uniswapV3`* 对应，属品牌命名差异）。
 
+**更细的流程、继承链与 `base` 模块说明**：见本文 **第十节**（与 `NonfungiblePositionManager.sol` 及 `v3-periphery/contracts/base/*.sol` 内中文注释一致）。
+
 ### 6.2 SwapRouter（v3-periphery）
 
 - `exactInput` / `exactOutput` 多跳路径编码在 `bytes path` 里。  
@@ -287,14 +310,70 @@ Solidity 版本不兼容时，把 **部署 LmPool** 与 **回写 Pool** 拆到�
 4. `masterchef-v3/contracts/MasterChefV3.sol`：`add`、`onERC721Received`、`harvest`、`updateLiquidityOperation`。
 5. `v3-periphery/contracts/NonfungiblePositionManager.sol`、`SwapRouter.sol`（回调与路径）。
 6. `router/contracts/SmartRouter.sol`（聚合能力）。
+7. （可选）`v3-periphery/contracts/base/` 下 NPM 的父合约：`LiquidityManagement.sol`、`Multicall.sol`、`ERC721Permit.sol`、`SelfPermit.sol`、`PeripheryPayments.sol` 等，与源码内中文注释对照阅读。
 
 ---
 
-## 十、附录：与官方 Uniswap V3 文档的对照
+## 十、NonfungiblePositionManager 与 `base` 模块（与源码注释对应）
+
+本章与 `v3-periphery/contracts/NonfungiblePositionManager.sol` 及其 **继承链上的父合约**（`v3-periphery/contracts/base/*.sol`）中的注释一致，便于从「产品流程」落到「调用链」。
+
+### 10.1 NPM 在做什么（一句话 + 形象类比）
+
+- **一句话**：把某口 V3 池上、某一 **tick 区间** 内的 **流动性头寸** 封装成 **ERC721**；增删流动性、收手续费都经 NPM 与 `PancakeV3Pool` 交互。  
+- **类比**：不是「整池 LP 份额凭证」，而是「你在某价格带里占的那一格」的**可转让凭证**（`tokenId`）。
+
+### 10.2 用户侧典型流程（建议按此顺序记）
+
+| 步骤 | 合约函数 | 结果 |
+| ---- | -------- | ---- |
+| 1 加池（若未定价） | `PoolInitializer.createAndInitializePoolIfNecessary` | 池存在且 `sqrtPriceX96` 非零 |
+| 2 首次建仓 | `mint` | 新 `tokenId`，链上记录 `tickLower/Upper`、`liquidity`、费用快照 |
+| 3 加仓 | `increaseLiquidity` | 同一 NFT 上追加流动性（**付款人为 `msg.sender`，不要求 NFT 持有人**） |
+| 4 减仓 | `decreaseLiquidity` | 从池子 `burn` 流动性，本金与费用记入 **`tokensOwed*`**，**不会自动打到钱包** |
+| 5 领取代币 | `collect` | 把 `tokensOwed` 与最新手续费从池子提到 `recipient`（需 **持有人或 approve**） |
+| 6 收尾 | `burn` | 仅当 `liquidity == 0` 且 `tokensOwed*` 均为 0 时可销毁 NFT |
+
+**面试常记**：`decrease` ≠ 提款；**`collect` 才是把钱领走**。
+
+### 10.3 继承关系与父合约职责（和 `NonfungiblePositionManager is …` 对齐）
+
+```
+INonfungiblePositionManager（接口）
+Multicall                    → multicall(bytes[])：一笔交易内 delegatecall 多次本合约函数
+ERC721Permit                 → permit：链下签名授权，免先 approve（依赖子类 _getAndIncrementNonce）
+  └ BlockTimestamp           → _blockTimestamp()：deadline / 测试覆写
+PeripheryImmutableState      → deployer, factory, WETH9（不可变）
+PoolInitializer              → createAndInitializePoolIfNecessary
+LiquidityManagement          → addLiquidity, pancakeV3MintCallback（付 token 给池）
+  └ PeripheryPayments        → pay / unwrapWETH9 / sweepToken / refundETH
+    └ PeripheryImmutableState
+PeripheryValidation          → checkDeadline（modifier）
+SelfPermit                   → selfPermit*：ERC20 EIP-2612 与 multicall 组合
+```
+
+**读代码顺序建议**：`PeripheryImmutableState` → `LiquidityManagement`（`addLiquidity` + `MintCallback`）→ `NonfungiblePositionManager`（`mint` / `collect` 里对 `feeGrowth` 与 `tokensOwed` 的更新）。
+
+### 10.4 与 `Multicall` + `SelfPermit` 的组合（实际集成场景）
+
+- **`multicall([selfPermit(...), mint(...)])`**：用户先对 USDT 等调 `permit` 授权 NPM，再 `mint`，**两笔逻辑、一笔交易**。  
+- **`multicall([selfPermitIfNecessary(...), increaseLiquidity(...)])`**：若 allowance 已够则跳过 permit。  
+- **NFT 侧**：对头寸 NFT 用 **`ERC721Permit.permit`**，聚合器可代用户执行 `decreaseLiquidity` / `collect` 而无需用户先链上 `approve`。
+
+### 10.5 关键实现细节（和面试点挂钩）
+
+- **池子地址**：`PoolAddress.computeAddress(deployer, poolKey)`，与 Core 的 CREATE2 一致；`LiquidityManagement` 里 **mint 回调**用 `CallbackValidation.verifyCallback` 防假池子。  
+- **付款路径**：`PeripheryPayments.pay` 处理「用户 ETH→WETH」「合约内余额」「`transferFrom` 用户」三种情况；`pancakeV3MintCallback` 里对池子付款。  
+- **权限**：`decreaseLiquidity` / `collect` / `burn` 使用 **`isAuthorizedForToken`**（持有人或 approved）；`increaseLiquidity` **无**该限制——集成方要注意「谁都可以给某个 `tokenId` 注资」的产品语义。
+
+---
+
+## 十一、附录：与官方 Uniswap V3 文档的对照
 
 - **概念不理解时**：优先查阅 Uniswap V3 白皮书与官方文档（集中流动性、tick、fee growth、oracle）。  
 - **本仓库差异点**：重点只看 `**lmPool` 三处钩子**、**LmTick 与 Tick 平行结构**、**MasterChef 与 NPM 的组合流程**。
 
 ---
 
-*文档生成自当前仓库源码结构分析；若你后续升级合约版本或改动经济模型，请以链上部署地址与最新 `README`/审计报告为准。*
+*文档生成自当前仓库源码结构分析；若你后续升级合约版本或改动经济模型，请以链上部署地址与最新 `README`/审计报告为准。*  
+*补充：`v3-core` 与 `v3-lm-pool` 的区别与「为何有两个 V3 目录」见第二节 **2.2**（紧接在「Factory 默认费率」一节之后）。*
