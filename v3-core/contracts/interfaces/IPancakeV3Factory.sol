@@ -4,8 +4,15 @@ pragma solidity >=0.5.0;
 /// @title The interface for the PancakeSwap V3 Factory
 /// @notice The PancakeSwap V3 Factory facilitates creation of PancakeSwap V3 pools and control over the protocol fees
 interface IPancakeV3Factory {
+    /// @notice 费率档位（fee tier）对应的扩展控制信息。
+    /// @dev 示例：新上线高风险费率档位时，可先设置 `whitelistRequested = true`，
+    /// 仅允许白名单地址创建池子；风控验证通过后，再将 `enabled = true` 正式开放。
     struct TickSpacingExtraInfo {
+        /// @notice 是否要求白名单才能创建该费率档位的池子。
+        /// @dev `true` 表示仅白名单可创建；`false` 表示无需白名单限制。
         bool whitelistRequested;
+        /// @notice 该费率档位是否启用。
+        /// @dev `true` 表示可用于创建池子；`false` 表示当前不可用。
         bool enabled;
     }
 
