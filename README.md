@@ -8,6 +8,88 @@
 
 ---
 
+## 十二、智能路由（SmartRouter）与业务全生命周期
+
+`SmartRouter` 是用户进入 SwapBased V3 生态的“流量枢纽”，它聚合了 V2、V3 及稳定币池的交换能力。
+
+### 12.1 业务全生命周期流程图 (PlantUML)
+
+```plantuml
+@startuml
+title SwapBased V3 智能路由与业务全生命周期
+
+skinparam ActivityFontSize 12
+skinparam ActivityDiamondFontSize 12
+
+start
+
+:== 阶段 1: 部署与基础设施初始化 ==;
+:部署 V2 Factory, V3 Factory, Stable Factory;
+:部署 WETH, PositionManager (NPM);
+:部署 **SmartRouter**;
+note right: 调用 constructor 并注入所有底层协议地址
+
+:== 阶段 2: 资产准备与交易 (Router 核心) ==;
+if (用户持有资产是否匹配?) then (不匹配)
+    :通过 **SmartRouter** 执行 Swap;
+    split
+        :调用 **V3SwapRouter.exactInput**;
+    split again
+        :调用 **V2SwapRouter.swapExactTokensForTokens**;
+    split again
+        :调用 **StableSwapRouter.exactInputStableSwap**;
+    split end
+    :获取目标 TokenA 和 TokenB;
+else (匹配)
+    :直接进入下一阶段;
+endif
+
+:== 阶段 3: 质押与做市 (NPM 阶段) ==;
+:调用 **NPM.mint** 创建 V3 头寸;
+:获得 Position NFT (tokenId);
+
+:== 阶段 4: 农场质押与领奖 (MasterChefV3 阶段) ==;
+:调用 **NPM.safeTransferFrom** 到 MasterChefV3;
+:MasterChef 托管 NFT 并开启 LM 收益累计;
+:一段时间后...;
+:调用 **MasterChefV3.harvest** 领取奖励;
+:MasterChef 调用 **RewardToken.mint** 发放奖励;
+
+:== 阶段 5: 退出与资产回兑 ==;
+:调用 **MasterChefV3.withdraw** 取回 NFT;
+:调用 **NPM.decreaseLiquidity** 移除流动性;
+:调用 **NPM.collect** 取回代币到钱包;
+:使用 **SmartRouter** 将奖励或本金兑换为目标资产;
+
+stop
+@endum
+```
+
+### 12.2 路由模块核心函数对照表
+
+| 业务环节 | 合约 | 核心函数 | 说明 |
+| :--- | :--- | :--- | :--- |
+| **部署初始化** | `SmartRouter` | `constructor` | 一次性绑定 V2/V3/Stable 三套协议地址，构建聚合能力 |
+| **精确输入交换** | `V3SwapRouter` | `exactInput` / `exactInputSingle` | V3 路径下的多跳或单跳精确输入交换 |
+| **精确输出交换** | `V3SwapRouter` | `exactOutput` / `exactOutputSingle` | V3 路径下根据目标产出反推输入的交换 |
+| **V2 兼容交换** | `V2SwapRouter` | `swapExactTokensForTokens` | 兼容传统 V2 恒定乘积池（x*y=k）的路径交换 |
+| **稳定币交换** | `StableSwapRouter` | `exactInputStableSwap` | 针对 USDT/BUSD 等低滑点曲线池的专用路由 |
+| **原子操作组合** | `MulticallExtended` | `multicall` | 将 `approve`、`wrap`、`swap` 等多个步骤打包在同一笔交易执行 |
+| **回调鉴权** | `V3SwapRouter` | `pancakeV3SwapCallback` | 核心回调：验证池地址并执行付款，防止恶意池攻击 |
+
+### 12.3 路由设计深度解析
+
+- **无状态性 (Statelessness)**:
+    Router 合约本身不持有任何资金储备（除非在交易中间态或用户误转），它仅作为“指令中转站”，通过 `pancakeV3SwapCallback` 等机制实现代币在用户与池子间的安全转移。
+- **多协议聚合 (Multi-Protocol Aggregation)**:
+    `SmartRouter` 通过继承多个特定的路由合约，使得前端可以通过一个入口地址覆盖所有流动性来源。它能根据 `path` 的编码格式自动识别是走 V3 的 `ticks` 逻辑还是 V2 的 `reserves` 逻辑。
+- **回调安全策略**:
+    在 `V3SwapRouter` 中，`SmartRouterHelper.verifyCallback` 是关键防线。它利用 `CREATE2` 的确定性地址推导，在回调时实时计算预期的池地址并与 `msg.sender` 对比，确保只有真实的池子才能触发转账。
+- **WETH 自动包装**:
+    继承自 `PeripheryPaymentsWithFeeExtended`，支持在交易前后自动处理 `ETH <-> WETH` 的转换，极大提升了用户直接使用原生币交易的体验。
+
+---
+
 ## 一、先从「一张图」理解项目在做什么
 
 ### 1.1 用户视角的两条主路径

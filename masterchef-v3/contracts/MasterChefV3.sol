@@ -17,84 +17,99 @@ import "./utils/Multicall.sol";
 import "./Enumerable.sol";
 
 interface IERC20Mintable is IERC20 {
+    /// @notice 奖励币必须实现的铸币接口。
+    /// @param recipient_ 收币地址（用户或协议地址）。
+    /// @param amount_ 铸造数量。
+    /// @return 是否铸造成功。
     function mint(address recipient_, uint256 amount_) external returns (bool);
 }
 
 /// @title MasterChefV3
-/// @notice V3 farming hub: holds position NFTs, coordinates with `ILMPool` for reward growth, and mints reward tokens per pool configuration.
-/// @dev Uses `rewardGrowthInside` snapshots per tokenId plus `boostLiquidity` for boosted emissions; not a Uniswap V2 LP MasterChef.
+/// @notice V3 挖矿中枢：托管仓位 NFT、联动 `ILMPool` 记录奖励增长，并按池配置铸造多奖励代币。
+/// @dev 通过 tokenId 对应区间的 `rewardGrowthInside` 快照 + `boostLiquidity` 做增量结算；不是 V2 LP 风格 MasterChef。
 contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, ReentrancyGuard, Enumerable {
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
-    /// @notice Farm pool metadata: links one V3 pool to allocation weight and optional multi-token reward mint targets.
+    /// @notice 挖矿池元信息：将某个 V3 池与权重、奖励代币配置绑定。
     struct PoolInfo {
         uint256 allocPoint;
-        // V3 pool address
+        // V3 核心池地址
         IPancakeV3Pool v3Pool;
-        // V3 pool token0 address
+        // V3 池 token0 地址
         address token0;
-        // V3 pool token1 address
+        // V3 池 token1 地址
         address token1;
-        // V3 pool fee
+        // V3 池费率档
         uint24 fee;
-        // total liquidity staking in the pool
+        // 池内已质押的总真实流动性
         uint256 totalLiquidity;
-        // total boost liquidity staking in the pool
+        // 池内已质押的总加权流动性（含 boost）
         uint256 totalBoostLiquidity;
 
         uint256[] rewardsRatio;
         address[] rewardsAddresses;
     }
 
-    /// @notice Per-NFT staking state: mirrors NPM liquidity plus boosted LM liquidity for `rewardGrowthInside` delta math.
+    /// @notice 单 NFT 质押状态：记录真实流动性、加权流动性与奖励快照，用于做增量结算。
     struct UserPositionInfo {
+        /// @notice 当前 NFT 在核心池中的真实流动性（未乘 boost）。
         uint128 liquidity;
+        /// @notice 参与挖矿结算用的“加权流动性”（真实流动性 * boostMultiplier）。
         uint128 boostLiquidity;
+        /// @notice 仓位下边界 tick。
         int24 tickLower;
+        /// @notice 仓位上边界 tick。
         int24 tickUpper;
+        /// @notice 上次结算后的区间奖励累计快照（来自 LMPool）。
         uint256 rewardGrowthInside;
+        /// @notice 已缓存但尚未发放的奖励（例如 update 时先缓存，后续 harvest 再领）。
         uint256 reward;
+        /// @notice 该 NFT 的实际拥有者（质押人）。
         address user;
+        /// @notice 对应主池 pid。
         uint256 pid;
+        /// @notice 当前 boost 倍率（1x~2x）。
         uint256 boostMultiplier;
     }
 
+    /// @notice 当前已创建的挖矿池数量（pid 从 1 开始）。
     uint256 public poolLength;
-    /// @notice Info of each MCV3 pool.
+    /// @notice 每个 MCV3 池的配置信息。
     mapping(uint256 => PoolInfo) public poolInfo;
 
-    /// @notice userPositionInfos[tokenId] => UserPositionInfo
-    /// @dev TokenId is unique, and we can query the pid by tokenId.
+    /// @notice userPositionInfos[tokenId] => UserPositionInfo。
+    /// @dev tokenId 全局唯一，可直接反查对应 pid。
     mapping(uint256 => UserPositionInfo) public userPositionInfos;
 
-    /// @notice v3PoolPid[token0][token1][fee] => pid
+    /// @notice v3PoolPid[token0][token1][fee] => pid。
     mapping(address => mapping(address => mapping(uint24 => uint256))) v3PoolPid;
-    /// @notice v3PoolAddressPid[v3PoolAddress] => pid
+    /// @notice v3PoolAddressPid[v3PoolAddress] => pid。
     mapping(address => uint256) public v3PoolAddressPid;
 
-    /// @notice Address of WETH contract.
+    /// @notice WETH 合约地址。
     address public immutable WETH;
     
-    /// @notice precision for rewards.
+    /// @notice 奖励比例计算精度（万分比，10000）。
     uint256 public immutable REWARDS_PRECISION = 10000;
 
-    /// @notice team emissions.
+    /// @notice 团队额外排放比例（当前常量 2%，预留用途）。
     uint256 public constant ownerFee = 200; // 2%
 
+    /// @notice 全局每秒排放总量（会按各池 allocPoint 比例分摊）。
     uint256 public globalCakePerSecond;
 
     INonfungiblePositionManager public immutable nonfungiblePositionManager;
 
-    /// @notice Address of liquidity mining pool deployer contract.
+    /// @notice LMPool 部署器地址。
     ILMPoolDeployer public LMPoolDeployer;
     
-    /// @notice Address of farm booster contract.
+    /// @notice Farm Booster 合约地址。
     IFarmBooster public FARM_BOOSTER;
 
-    /// @notice Only use for emergency situations.
+    /// @notice 紧急模式开关（仅紧急场景使用）。
     bool public emergency;
 
-    /// @notice Total allocation points. Must be the sum of all pools' allocation points.
+    /// @notice 全部池子权重总和（应等于所有池 allocPoint 之和）。
     uint256 public totalAllocPoint;
 
     uint256 public latestPeriodNumber;
@@ -102,16 +117,16 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
     uint256 public latestPeriodEndTime;
     uint256 public latestPeriodCakePerSecond;
 
-    /// @notice Address of the operator.
+    /// @notice 运维操作员地址（owner 之外可执行部分维护操作）。
     address public operatorAddress;
-    /// @notice Default period duration.
+    /// @notice 默认排放周期时长。
     uint256 public PERIOD_DURATION = 1 days;
     uint256 public constant MAX_DURATION = 365 days;
     uint256 public constant MIN_DURATION = 1 days;
     uint256 public constant PRECISION = 1e12;
-        /// @notice Basic boost factor, none boosted user's boost factor
+    /// @notice 基础 boost 精度（1x；未加成用户使用该值）。
     uint256 public constant BOOST_PRECISION = 100 * 1e10;
-    /// @notice Hard limit for maxmium boost factor, it must greater than BOOST_PRECISION
+    /// @notice boost 上限（2x），必须大于 BOOST_PRECISION。
     uint256 public constant MAX_BOOST_PRECISION = 200 * 1e10;
     uint256 constant Q128 = 0x100000000000000000000000000000000;
 
@@ -169,34 +184,39 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
     event SetEmergency(bool emergency);
     event NewCakePerSecond(uint256 globalCakePerSecond);
 
+    /// @notice 仅 owner 或 operator 可调用。
     modifier onlyOwnerOrOperator() {
         if (msg.sender != operatorAddress && msg.sender != owner()) revert NotOwnerOrOperator();
         _;
     }
 
+    /// @notice 校验 pid 合法性（pid=0 视为无效，且不能超过 poolLength）。
     modifier onlyValidPid(uint256 _pid) {
         if (_pid == 0 || _pid > poolLength) revert InvalidPid();
         _;
     }
 
-    /**
-     * @dev Throws if caller is not the boost contract.
-     */
+    /// @notice 仅 boost 合约可调用。
+    /// @dev 若调用者不是 FARM_BOOSTER 则回滚。
     modifier onlyBoostContract() {
         require(address(FARM_BOOSTER) == msg.sender, "Not farm boost contract");
         _;
     }
 
-    /// @param _nonfungiblePositionManager the NFT position manager contract address.
+    /// @notice 构造函数：绑定 NPM 与 WETH。
+    /// @param _nonfungiblePositionManager V3 PositionManager 地址（本合约通过它接收/管理 NFT 仓位）。
+    /// @param _WETH WETH 地址（处理 ETH/WETH 转换与退款）。
+    /// @param initialOwner 初始管理员地址。
+    /// @dev 场景示例：部署后由多签作为 owner，运营地址作为 operator，统一管理挖矿池与排放参数。
     constructor(INonfungiblePositionManager _nonfungiblePositionManager, address _WETH, address initialOwner) Ownable(initialOwner) {
         nonfungiblePositionManager = _nonfungiblePositionManager;
         WETH = _WETH;
     }
 
-    /// @notice Returns the cake per second , period end time.
-    /// @param _pid The pool pid.
-    /// @return cakePerSecond Cake reward per second.
-    /// @return endTime Period end time.
+    /// @notice 按 pid 查询该池当前每秒排放与本期结束时间。
+    /// @param _pid 池子 pid。
+    /// @return cakePerSecond 该池每秒奖励（按权重分摊后）。
+    /// @return endTime 当前周期结束时间。
     function getLatestPeriodInfoByPid(uint256 _pid) public view returns (uint256 cakePerSecond, uint256 endTime) {
         if (totalAllocPoint > 0) {
             cakePerSecond = (globalCakePerSecond * poolInfo[_pid].allocPoint) / totalAllocPoint;
@@ -210,16 +230,21 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         rewardsAddresses = info.rewardsAddresses;
     }
 
+    /// @notice 设置某池的多奖励比例与代币地址。
+    /// @param _pid 池子 pid。
+    /// @param _rewardsRatio 奖励比例数组（总和一般为 10000，即 REWARDS_PRECISION）。
+    /// @param _rewardsAddresses 奖励代币地址数组（需实现 mint）。
+    /// @dev 示例：`[8000,2000] + [CAKE,xCAKE]` 表示用户奖励 80% 发 CAKE，20% 发 xCAKE。
     function setRewardsRatioInfoByPid(uint256 _pid, uint256[] memory _rewardsRatio, address[] memory _rewardsAddresses) public onlyOwner {
         PoolInfo storage info = poolInfo[_pid];
         info.rewardsRatio = _rewardsRatio;
         info.rewardsAddresses = _rewardsAddresses;
     }
 
-    /// @notice Returns the cake per second , period end time. This is for liquidity mining pool.
-    /// @param _v3Pool Address of the V3 pool.
-    /// @return cakePerSecond Cake reward per second.
-    /// @return endTime Period end time.
+    /// @notice 按 V3 池地址查询该池每秒排放与结束时间（供 LMPool 调用）。
+    /// @param _v3Pool V3 池地址。
+    /// @return cakePerSecond 该池每秒奖励。
+    /// @return endTime 当前周期结束时间。
     function getLatestPeriodInfo(address _v3Pool) public view returns (uint256 cakePerSecond, uint256 endTime) {
         if (totalAllocPoint > 0) {
             cakePerSecond =
@@ -229,10 +254,10 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         endTime = latestPeriodEndTime;
     }
 
-    /// @notice View function for checking pending CAKE rewards.
-    /// @dev The pending cake amount is based on the last state in LMPool. The actual amount will happen whenever liquidity changes or harvest.
-    /// @param _tokenId Token Id of NFT.
-    /// @return reward Pending reward.
+    /// @notice 查询某 NFT 当前可领取奖励（预估值）。
+    /// @dev 该值基于 LMPool 当前状态计算，最终实际到账以触发 harvest/update 时结算结果为准。
+    /// @param _tokenId NFT tokenId。
+    /// @return reward 待领取奖励。
     function pendingCake(uint256 _tokenId) external view returns (uint256 reward) {
         UserPositionInfo memory positionInfo = userPositionInfos[_tokenId];
         if (positionInfo.pid != 0) {
@@ -254,33 +279,43 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         }
     }
 
-    /// @notice For emergency use only.
+    /// @notice 紧急开关：打开后会跳过部分 LMPool 结算路径，便于应对异常。
+    /// @dev 仅应急使用，恢复后应尽快回到正常模式。
     function setEmergency(bool _emergency) external onlyOwner {
         emergency = _emergency;
         emit SetEmergency(emergency);
     }
 
+    /// @notice 设置 LMPool 部署器地址。
+    /// @param _LMPoolDeployer 部署器地址。
+    /// @dev 新增池时需要通过它创建/绑定对应 LMPool。
     function setLMPoolDeployer(ILMPoolDeployer _LMPoolDeployer) external onlyOwner {
         if (address(_LMPoolDeployer) == address(0)) revert ZeroAddress();
         LMPoolDeployer = _LMPoolDeployer;
         emit NewLMPoolDeployerAddress(address(_LMPoolDeployer));
     }
 
-    /// @notice Add a new pool. Can only be called by the owner.
-    /// @notice One v3 pool can only create one pool.
-    /// @param _allocPoint Number of allocation points for the new pool.
-    /// @param _v3Pool Address of the V3 pool.
-    /// @param _withUpdate Whether call "massUpdatePools" operation.
+    /// @notice 新增一个挖矿池（一个 V3 池只能映射一个 pid）。
+    /// @param _allocPoint 新池权重（用于分摊全局每秒排放）。
+    /// @param _v3Pool V3 核心池地址。
+    /// @param _withUpdate 是否先全量刷新各池奖励。
+    /// @param _rewardsRatio 多奖励比例数组（通常总和=10000）。
+    /// @param _rewardsAddresses 多奖励代币地址数组。
+    /// @dev 使用场景：运营要上线一个新交易对农场（如 USDT/BNB 0.25%），先 add 池，再让用户质押 NFT。
     function add(uint256 _allocPoint, IPancakeV3Pool _v3Pool, bool _withUpdate, uint256[] memory _rewardsRatio, address[] memory _rewardsAddresses) external onlyOwner {
+        // 若要求先更新，先把旧池奖励累计到最新时间点，避免新池加入导致历史分摊失真。
         if (_withUpdate) massUpdatePools();
 
+        // 为该 V3 池部署并绑定对应的 LMPool（负责按 tick 区间记录奖励累计）。
         ILMPool lmPool = LMPoolDeployer.deploy(_v3Pool);
 
         totalAllocPoint += _allocPoint;
         address token0 = _v3Pool.token0();
         address token1 = _v3Pool.token1();
         uint24 fee = _v3Pool.fee();
+        // 同一 token0/token1/fee 的池子只能注册一次，避免重复计奖。
         if (v3PoolPid[token0][token1][fee] != 0) revert DuplicatedPool(v3PoolPid[token0][token1][fee]);
+        // 预先给 NPM 最大授权，便于后续 increase/decrease/collect 等流程无须重复 approve。
         if (IERC20(token0).allowance(address(this), address(nonfungiblePositionManager)) == 0)
             IERC20(token0).safeApprove(address(nonfungiblePositionManager), type(uint256).max);
         if (IERC20(token1).allowance(address(this), address(nonfungiblePositionManager)) == 0)
@@ -305,15 +340,17 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         emit AddPool(poolLength, _allocPoint, _v3Pool, lmPool);
     }
 
-    /// @notice Update the given pool's CAKE allocation point. Can only be called by the owner.
-    /// @param _pid The id of the pool. See `poolInfo`.
-    /// @param _allocPoint New number of allocation points for the pool.
-    /// @param _withUpdate Whether call "massUpdatePools" operation.
+    /// @notice 更新某池权重 allocPoint。
+    /// @param _pid 池子 pid。
+    /// @param _allocPoint 新权重。
+    /// @param _withUpdate 是否先全量刷新。
+    /// @dev 使用场景：调整活动池激励强度（例如新池活动期临时提高权重）。
     function set(uint256 _pid, uint256 _allocPoint, bool _withUpdate) external onlyOwner onlyValidPid(_pid) {
         uint32 currentTime = uint32(block.timestamp);
         PoolInfo storage pool = poolInfo[_pid];
         ILMPool LMPool = ILMPool(pool.v3Pool.lmPool());
         if (address(LMPool) != address(0)) {
+            // 先累计到当前时间，确保改权重前的奖励已经按旧权重入账。
             LMPool.accumulateReward(currentTime);
         }
 
@@ -332,13 +369,22 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         uint128 liquidity;
     }
 
-    /// @notice ERC721 callback: user stakes a V3 position NFT; we register ticks, sync LM stake, and snapshot `rewardGrowthInside`.
+    /// @notice ERC721 回调：用户把 V3 NFT 转入本合约即视为“质押”。
+    /// @dev 核心流程（逐行）：
+    /// 1) 只接受来自 NPM 的 NFT；
+    /// 2) 读取 NFT 的 token0/token1/fee/tick/liquidity；
+    /// 3) 定位 pid 并检查对应 LMPool 存在；
+    /// 4) 累计一次 LMPool 奖励到当前时间；
+    /// 5) 调 `updateLiquidityOperation` 把本 NFT 的 boost 流动性写入 LMPool；
+    /// 6) 保存 rewardGrowthInside 快照，作为后续增量结算基线。
+    /// @dev 案例：用户把 tokenId=123（USDT/BNB 区间仓位）转进来后，就开始参与该池挖矿计奖。
     function onERC721Received(
         address,
         address _from,
         uint256 _tokenId,
         bytes calldata
     ) external nonReentrant returns (bytes4) {
+        // 仅接受 NPM 发来的仓位 NFT，防止恶意 ERC721 混入。
         if (msg.sender != address(nonfungiblePositionManager)) revert NotPancakeNFT();
         DepositCache memory cache;
         (
@@ -355,8 +401,10 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
             ,
 
         ) = nonfungiblePositionManager.positions(_tokenId);
+        // 零流动性 NFT 不允许质押（无法产生奖励）。
         if (cache.liquidity == 0) revert NoLiquidity();
         uint256 pid = v3PoolPid[cache.token0][cache.token1][cache.fee];
+        // 该 NFT 对应池未被 add 到 MasterChef，拒绝质押。
         if (pid == 0) revert InvalidNFT();
         PoolInfo memory pool = poolInfo[pid];
         ILMPool LMPool = ILMPool(pool.v3Pool.lmPool());
@@ -368,23 +416,24 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         positionInfo.tickUpper = cache.tickUpper;
         positionInfo.user = _from;
         positionInfo.pid = pid;
-        // Need to update LMPool.
+        // 先更新 LMPool 全局累计，确保本次入金时基线正确。
         LMPool.accumulateReward(uint32(block.timestamp));
+        // 写入当前 NFT 的流动性与 boost 流动性到 LMPool。
         updateLiquidityOperation(positionInfo, _tokenId, 0);
 
         positionInfo.rewardGrowthInside = LMPool.getRewardGrowthInside(cache.tickLower, cache.tickUpper);
 
-        // Update Enumerable
+        // 更新可枚举持仓集合
         addToken(_from, _tokenId);
         emit Deposit(_from, pid, _tokenId, cache.liquidity, cache.tickLower, cache.tickUpper);
 
         return this.onERC721Received.selector;
     }
 
-    /// @notice harvest cake from pool.
-    /// @param _tokenId Token Id of NFT.
-    /// @param _to Address to.
-    /// @return reward Cake reward.
+    /// @notice 领取指定 NFT 的奖励。
+    /// @param _tokenId NFT tokenId。
+    /// @param _to 奖励接收地址。
+    /// @return reward 本次领取奖励。
     function harvest(uint256 _tokenId, address _to) external nonReentrant returns (uint256 reward) {
         UserPositionInfo storage positionInfo = userPositionInfos[_tokenId];
         if (positionInfo.user != msg.sender) revert NotOwner();
@@ -392,6 +441,12 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         reward = harvestOperation(positionInfo, _tokenId, _to);
     }
 
+    /// @notice harvest 的内部实现：先算增量奖励，再决定是立即发放还是仅缓存。
+    /// @param positionInfo NFT 对应用户仓位信息（storage）。
+    /// @param _tokenId NFT id。
+    /// @param _to 发奖接收地址；传 0 表示只更新缓存不转账。
+    /// @return reward 本次可领取总奖励（含历史缓存）。
+    /// @dev 案例：`updateLiquidity` 调用时会传 `_to=0`，先把奖励记账；用户手动 harvest 再真实 mint 到钱包。
     function harvestOperation(
         UserPositionInfo storage positionInfo,
         uint256 _tokenId,
@@ -400,44 +455,50 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         PoolInfo memory pool = poolInfo[positionInfo.pid];
         ILMPool LMPool = ILMPool(pool.v3Pool.lmPool());
         if (address(LMPool) != address(0) && !emergency) {
-            // Update rewardGrowthInside
+            // 1) 先把 LMPool 累计到当前时间点，避免漏算时间奖励。
             LMPool.accumulateReward(uint32(block.timestamp));
+            // 2) 读取当前区间累计值，与上次快照做差。
             uint256 rewardGrowthInside = LMPool.getRewardGrowthInside(positionInfo.tickLower, positionInfo.tickUpper);
 
             uint256 rewardGrowthInsideDelta;
             unchecked {
                 rewardGrowthInsideDelta = rewardGrowthInside - positionInfo.rewardGrowthInside;
             }
+            // 3) 增量奖励 = 区间累计增量 * boost流动性 / Q128。
             reward = (rewardGrowthInsideDelta * positionInfo.boostLiquidity) / Q128;
             positionInfo.rewardGrowthInside = rewardGrowthInside;
         }
+        // 4) 叠加历史缓存奖励（上次未提走）。
         reward += positionInfo.reward;
 
         if (reward > 0) {
             if (_to != address(0)) {
+                // 真实发放路径：清缓存并 mint 多奖励币到目标地址。
                 positionInfo.reward = 0;
                 _safeTransfer(_to, reward, positionInfo.pid);
                 emit Harvest(msg.sender, _to, positionInfo.pid, _tokenId, reward);
             } else {
+                // 仅记账路径：不转账，等待后续 harvest/withdraw 再发放。
                 positionInfo.reward = reward;
             }
         }
     }
 
-    /// @notice Withdraw LP tokens from pool.
-    /// @param _tokenId Token Id of NFT to deposit.
-    /// @param _to Address to which NFT token to withdraw.
-    /// @return reward Cake reward.
+    /// @notice 退出质押并取回 NFT；退出前会自动结算并发放奖励。
+    /// @param _tokenId 待退出的 NFT tokenId。
+    /// @param _to 提回 NFT 的接收地址。
+    /// @return reward 本次结算奖励。
     function withdraw(uint256 _tokenId, address _to) external nonReentrant returns (uint256 reward) {
         if (_to == address(this) || _to == address(0)) revert WrongReceiver();
         UserPositionInfo storage positionInfo = userPositionInfos[_tokenId];
         if (positionInfo.user != msg.sender) revert NotOwner();
+        // 1) 先 harvest，避免退出后遗留奖励无法结算。
         reward = harvestOperation(positionInfo, _tokenId, _to);
         uint256 pid = positionInfo.pid;
         PoolInfo storage pool = poolInfo[pid];
         ILMPool LMPool = ILMPool(pool.v3Pool.lmPool());
         if (address(LMPool) != address(0) && !emergency) {
-            // Remove all liquidity from liquidity mining pool.
+            // 2) 从 LMPool 移除本 NFT 的全部 boost 流动性，停止后续计奖。
             int128 liquidityDelta = -int128(positionInfo.boostLiquidity);
             LMPool.updatePosition(positionInfo.tickLower, positionInfo.tickUpper, liquidityDelta);
             emit UpdateLiquidity(
@@ -452,17 +513,18 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         pool.totalLiquidity -= positionInfo.liquidity;
         pool.totalBoostLiquidity -= positionInfo.boostLiquidity;
 
+        // 3) 清理本地仓位记录与可枚举集合，再把 NFT 还给用户指定地址。
         delete userPositionInfos[_tokenId];
-        // Update Enumerable
+        // 更新可枚举持仓集合
         removeToken(msg.sender, _tokenId);
-        // Remove boosted token id in farm booster.
+        // 在 farm booster 中移除该 tokenId 的 boost 记录
         if (address(FARM_BOOSTER) != address(0)) FARM_BOOSTER.removeBoostMultiplier(msg.sender, _tokenId, pid);
         nonfungiblePositionManager.safeTransferFrom(address(this), _to, _tokenId);
         emit Withdraw(msg.sender, _to, pid, _tokenId);
     }
 
-    /// @notice Update liquidity for the NFT position.
-    /// @param _tokenId Token Id of NFT to update.
+    /// @notice 同步指定 NFT 的流动性变化（例如用户在外部对该 NFT 做了增减流动性）。
+    /// @param _tokenId 需要同步的 NFT tokenId。
     function updateLiquidity(uint256 _tokenId) external nonReentrant {
         UserPositionInfo storage positionInfo = userPositionInfos[_tokenId];
         if (positionInfo.pid == 0) revert InvalidNFT();
@@ -470,9 +532,9 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         updateLiquidityOperation(positionInfo, _tokenId, 0);
     }
     
-    /// @notice Update farm boost multiplier for the NFT position.
-    /// @param _tokenId Token Id of NFT to update.
-    /// @param _newMultiplier New boost multiplier.
+    /// @notice 由 Boost 合约回调更新某 NFT 的 boost 倍率。
+    /// @param _tokenId 需要更新 boost 的 NFT tokenId。
+    /// @param _newMultiplier 新 boost 倍率。
     function updateBoostMultiplier(uint256 _tokenId, uint256 _newMultiplier) external onlyBoostContract {
         UserPositionInfo storage positionInfo = userPositionInfos[_tokenId];
         if (positionInfo.pid == 0) revert InvalidNFT();
@@ -480,6 +542,17 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         updateLiquidityOperation(positionInfo, _tokenId, _newMultiplier);
     }
 
+    /// @notice 核心流动性同步逻辑：刷新 liquidity、计算 boostLiquidity、把差值写入 LMPool。
+    /// @param positionInfo NFT 对应仓位信息（storage）。
+    /// @param _tokenId NFT id。
+    /// @param _newMultiplier 外部指定的新 boost 倍率（0 表示从 FARM_BOOSTER 读取最新）。
+    /// @dev 核心步骤（逐行）：
+    /// 1) 从 NPM 读取最新 liquidity/tick；
+    /// 2) 若真实 liquidity 变化，更新池总流动性；
+    /// 3) 获取并裁剪 boost 倍率到 [1x,2x]；
+    /// 4) 计算新 boostLiquidity，与旧值做 delta；
+    /// 5) delta != 0 时写入 LMPool.updatePosition，同步挖矿有效流动性。
+    /// @dev 案例：用户从 1.0x 提升到 1.5x，真实 liquidity=1000，则 boostLiquidity 从 1000 变 1500，delta=+500。
     function updateLiquidityOperation(
         UserPositionInfo storage positionInfo,
         uint256 _tokenId,
@@ -489,19 +562,21 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
             _tokenId
         );
         PoolInfo storage pool = poolInfo[positionInfo.pid];
+        // 若 NFT 在 NPM 中真实流动性已变化（比如用户增加了流动性），先同步主池统计。
         if (positionInfo.liquidity != liquidity) {
             pool.totalLiquidity = pool.totalLiquidity - positionInfo.liquidity + liquidity;
             positionInfo.liquidity = liquidity;
         }
         uint256 boostMultiplier = BOOST_PRECISION;
         if (address(FARM_BOOSTER) != address(0) && _newMultiplier == 0) {
-            // Get the latest boostMultiplier and update boostMultiplier in farm booster.
+            // 常规路径：向 FARM_BOOSTER 拉取最新倍率，并让 booster 侧同步状态。
             boostMultiplier = FARM_BOOSTER.updatePositionBoostMultiplier(_tokenId);
         } else if (_newMultiplier != 0) {
-            // Update boostMultiplier from farm booster call.
+            // booster 主动回调路径：直接使用传入倍率。
             boostMultiplier = _newMultiplier;
         }
 
+        // 保底 1x，封顶 2x，避免越界导致奖励异常。
         if (boostMultiplier < BOOST_PRECISION) {
             boostMultiplier = BOOST_PRECISION;
         } else if (boostMultiplier > MAX_BOOST_PRECISION) {
@@ -512,6 +587,7 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         uint128 boostLiquidity = ((uint256(liquidity) * boostMultiplier) / BOOST_PRECISION).toUint128();
         int128 liquidityDelta = int128(boostLiquidity) - int128(positionInfo.boostLiquidity);
         if (liquidityDelta != 0) {
+            // 更新池级 boost 总量，并将 delta 同步到 LMPool（真正影响 rewardGrowthInside 分母）。
             pool.totalBoostLiquidity = pool.totalBoostLiquidity - positionInfo.boostLiquidity + boostLiquidity;
             positionInfo.boostLiquidity = boostLiquidity;
             ILMPool LMPool = ILMPool(pool.v3Pool.lmPool());
@@ -521,16 +597,13 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         }
     }
 
-    /// @notice Increases the amount of liquidity in a position, with tokens paid by the `msg.sender`
-    /// @param params tokenId The ID of the token for which liquidity is being increased,
-    /// amount0Desired The desired amount of token0 to be spent,
-    /// amount1Desired The desired amount of token1 to be spent,
-    /// amount0Min The minimum amount of token0 to spend, which serves as a slippage check,
-    /// amount1Min The minimum amount of token1 to spend, which serves as a slippage check,
-    /// deadline The time by which the transaction must be included to effect the change
-    /// @return liquidity The new liquidity amount as a result of the increase
-    /// @return amount0 The amount of token0 to acheive resulting liquidity
-    /// @return amount1 The amount of token1 to acheive resulting liquidity
+    /// @notice 增加已质押 NFT 的流动性（代币由调用者支付）。
+    /// @param params NPM 的 increaseLiquidity 参数（含 tokenId、投入期望量、最小量、截止时间）。
+    /// @return liquidity 本次新增流动性。
+    /// @return amount0 实际消耗 token0。
+    /// @return amount1 实际消耗 token1。
+    /// @dev 使用场景：用户已有仓位表现好，希望“加仓同一区间”扩大挖矿份额。
+    /// @dev 逻辑：收款 -> 调 NPM 增流动性 -> 退回未用完资金 -> 缓存奖励 -> 同步 boost 流动性。
     function increaseLiquidity(
         IncreaseLiquidityParams memory params
     ) external payable nonReentrant returns (uint128 liquidity, uint256 amount0, uint256 amount1) {
@@ -539,6 +612,7 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         PoolInfo memory pool = poolInfo[positionInfo.pid];
         pay(pool.token0, params.amount0Desired);
         pay(pool.token1, params.amount1Desired);
+        // 若两个币都不是 WETH，却带了 ETH，判定为异常输入。
         if (pool.token0 != WETH && pool.token1 != WETH && msg.value > 0) revert();
         (liquidity, amount0, amount1) = nonfungiblePositionManager.increaseLiquidity{value: msg.value}(params);
         uint256 token0Left = params.amount0Desired - amount0;
@@ -549,13 +623,15 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         if (token1Left > 0) {
             refund(pool.token1, token1Left);
         }
+        // 增仓后先结算一次奖励到缓存，再更新 liquidity/boost。
         harvestOperation(positionInfo, params.tokenId, address(0));
         updateLiquidityOperation(positionInfo, params.tokenId, 0);
     }
 
-    /// @notice Pay.
-    /// @param _token The token to pay
-    /// @param _amount The amount to pay
+    /// @notice 收取用户本次操作所需代币。
+    /// @param _token 代币地址。
+    /// @param _amount 需要支付数量。
+    /// @dev 若是 WETH 路径且带 ETH，则要求 msg.value 与 _amount 一致，避免金额错配。
     function pay(address _token, uint256 _amount) internal {
         if (_token == WETH && msg.value > 0) {
             if (msg.value != _amount) revert InconsistentAmount();
@@ -564,9 +640,10 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         }
     }
 
-    /// @notice Refund.
-    /// @param _token The token to refund
-    /// @param _amount The amount to refund
+    /// @notice 退还本次未用完代币给调用者。
+    /// @param _token 代币地址。
+    /// @param _amount 退款数量。
+    /// @dev 若是 WETH 路径且用户走 ETH，先从 NPM 退回 ETH，再转给用户。
     function refund(address _token, uint256 _amount) internal {
         if (_token == WETH && msg.value > 0) {
             nonfungiblePositionManager.refundETH();
@@ -576,14 +653,11 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         }
     }
 
-    /// @notice Decreases the amount of liquidity in a position and accounts it to the position
-    /// @param params tokenId The ID of the token for which liquidity is being decreased,
-    /// amount The amount by which liquidity will be decreased,
-    /// amount0Min The minimum amount of token0 that should be accounted for the burned liquidity,
-    /// amount1Min The minimum amount of token1 that should be accounted for the burned liquidity,
-    /// deadline The time by which the transaction must be included to effect the change
-    /// @return amount0 The amount of token0 accounted to the position's tokens owed
-    /// @return amount1 The amount of token1 accounted to the position's tokens owed
+    /// @notice 减少 NFT 流动性（仅 owner），并同步挖矿侧流动性。
+    /// @param params NPM 的 decreaseLiquidity 参数。
+    /// @return amount0 本次减仓对应 token0 数量。
+    /// @return amount1 本次减仓对应 token1 数量。
+    /// @dev 使用场景：用户缩减仓位或准备退出。
     function decreaseLiquidity(
         DecreaseLiquidityParams memory params
     ) external nonReentrant returns (uint256 amount0, uint256 amount1) {
@@ -594,14 +668,11 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         updateLiquidityOperation(positionInfo, params.tokenId, 0);
     }
 
-    /// @notice Collects up to a maximum amount of fees owed to a specific position to the recipient
-    /// @param params tokenId The ID of the NFT for which tokens are being collected,
-    /// recipient The account that should receive the tokens,
-    /// @dev Warning!!! Please make sure to use multicall to call unwrapWETH9 or sweepToken when set recipient address(0), or you will lose your funds.
-    /// amount0Max The maximum amount of token0 to collect,
-    /// amount1Max The maximum amount of token1 to collect
-    /// @return amount0 The amount of fees collected in token0
-    /// @return amount1 The amount of fees collected in token1
+    /// @notice 领取仓位手续费/本金到指定接收地址。
+    /// @param params NPM collect 参数。
+    /// @return amount0 实际领取 token0。
+    /// @return amount1 实际领取 token1。
+    /// @dev 注意：recipient=0 时资金先留在本合约，通常应搭配 multicall 再 `unwrapWETH9/sweepToken` 转走。
     function collect(CollectParams memory params) external nonReentrant returns (uint256 amount0, uint256 amount1) {
         UserPositionInfo memory positionInfo = userPositionInfos[params.tokenId];
         if (positionInfo.user != msg.sender) revert NotOwner();
@@ -609,11 +680,12 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         (amount0, amount1) = nonfungiblePositionManager.collect(params);
     }
 
-    /// @notice Collects up to a maximum amount of fees owed to a specific position to the recipient, then refund.
-    /// @param params CollectParams.
-    /// @param to Refund recipent.
-    /// @return amount0 The amount of fees collected in token0
-    /// @return amount1 The amount of fees collected in token1
+    /// @notice collect 增强版：当 recipient=0 时，自动把本合约里的 token/WETH 退到 `to`。
+    /// @param params NPM collect 参数。
+    /// @param to 退款接收地址（0 表示默认 msg.sender）。
+    /// @return amount0 实际领取 token0。
+    /// @return amount1 实际领取 token1。
+    /// @dev 使用场景：前端不想写复杂 multicall，可直接用 collectTo 一次性提到用户钱包。
     function collectTo(
         CollectParams memory params,
         address to
@@ -622,7 +694,7 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         if (positionInfo.user != msg.sender) revert NotOwner();
         if (params.recipient == address(0)) params.recipient = address(this);
         (amount0, amount1) = nonfungiblePositionManager.collect(params);
-        // Need to refund token to user when recipient is zero address
+        // recipient=本合约时，说明 collect 资金暂存在本合约，这里自动转给用户。
         if (params.recipient == address(this)) {
             PoolInfo memory pool = poolInfo[positionInfo.pid];
             if (to == address(0)) to = msg.sender;
@@ -631,9 +703,10 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         }
     }
 
-    /// @notice Transfer token from MasterChef V3.
-    /// @param _token The token to transfer.
-    /// @param _to The to address.
+    /// @notice 把本合约持有的指定代币余额全部转给目标地址。
+    /// @param _token 代币地址。
+    /// @param _to 接收地址。
+    /// @dev 若 _token=WETH，会先 unwrap 成 ETH 再转账。
     function transferToken(address _token, address _to) internal {
         uint256 balance = IERC20(_token).balanceOf(address(this));
         if (balance > 0) {
@@ -646,10 +719,9 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         }
     }
 
-    /// @notice Unwraps the contract's WETH9 balance and sends it to recipient as ETH.
-    /// @dev The amountMinimum parameter prevents malicious contracts from stealing WETH9 from users.
-    /// @param amountMinimum The minimum amount of WETH9 to unwrap
-    /// @param recipient The address receiving ETH
+    /// @notice 把本合约中的 WETH 全部解包为 ETH 并发送给 recipient。
+    /// @param amountMinimum 最小解包量（防止被恶意调用偷小额余额）。
+    /// @param recipient ETH 接收地址。
     function unwrapWETH9(uint256 amountMinimum, address recipient) external nonReentrant {
         uint256 balanceWETH = IWETH(WETH).balanceOf(address(this));
         if (balanceWETH < amountMinimum) revert InsufficientAmount();
@@ -660,11 +732,10 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         }
     }
 
-        /// @notice Transfers the full amount of a token held by this contract to recipient
-    /// @dev The amountMinimum parameter prevents malicious contracts from stealing the token from users
-    /// @param token The contract address of the token which will be transferred to `recipient`
-    /// @param amountMinimum The minimum amount of token required for a transfer
-    /// @param recipient The destination address of the token
+    /// @notice 把本合约中的某 ERC20 余额全部扫给 recipient。
+    /// @param token 代币地址。
+    /// @param amountMinimum 最小扫出量（防恶意小额盗扫）。
+    /// @param recipient 接收地址。
     function sweepToken(address token, uint256 amountMinimum, address recipient) external nonReentrant {
         uint256 balanceToken = IERC20(token).balanceOf(address(this));
         if (balanceToken < amountMinimum) revert InsufficientAmount();
@@ -674,32 +745,33 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         }
     }
 
-    /// @notice Burns a token ID, which deletes it from the NFT contract. The token must have 0 liquidity and all tokens
-    /// must be collected first.
-    /// @param _tokenId The ID of the token that is being burned
+    /// @notice 销毁已清空仓位的 NFT（必须无流动性且无未领奖励）。
+    /// @param _tokenId NFT id。
+    /// @dev 使用场景：用户彻底退出策略后，清理 NFT 记录，避免残留状态。
     function burn(uint256 _tokenId) external nonReentrant {
         UserPositionInfo memory positionInfo = userPositionInfos[_tokenId];
         if (positionInfo.user != msg.sender) revert NotOwner();
         if (positionInfo.reward > 0 || positionInfo.liquidity > 0) revert NotEmpty();
         delete userPositionInfos[_tokenId];
-        // Update Enumerable
+        // 更新可枚举持仓集合
         removeToken(msg.sender, _tokenId);
-        // Remove boosted token id in farm booster.
+        // 在 farm booster 中移除该 tokenId 的 boost 记录
         if (address(FARM_BOOSTER) != address(0))
             FARM_BOOSTER.removeBoostMultiplier(msg.sender, _tokenId, positionInfo.pid);
         nonfungiblePositionManager.burn(_tokenId);
         emit Withdraw(msg.sender, address(0), positionInfo.pid, _tokenId);
     }
 
-    /// @notice Upkeep period.
-    /// @param _amount The amount of cake injected.
-    /// @param _duration The period duration.
-    /// @param _withUpdate Whether call "massUpdatePools" operation.
+    /// @notice 开启新一期排放周期（更新周期元数据与每秒排放快照）。
+    /// @param _amount 预留参数（当前逻辑未直接使用）。
+    /// @param _duration 周期时长；不合法时回退默认 PERIOD_DURATION。
+    /// @param _withUpdate 是否先更新全部池奖励累计。
+    /// @dev 使用场景：每日/每周运维滚动排放窗口，便于前端展示“本期结束时间”。
     function upkeep(uint256 _amount, uint256 _duration, bool _withUpdate) external onlyOwner {
         if (_withUpdate) massUpdatePools();
 
         uint256 duration = PERIOD_DURATION;
-        // Only use the _duration when _duration is between MIN_DURATION and MAX_DURATION.
+        // 仅当 _duration 在合法区间 [MIN_DURATION, MAX_DURATION] 时才使用它。
         if (_duration >= MIN_DURATION && _duration <= MAX_DURATION) duration = _duration;
         uint256 currentTime = block.timestamp;
         uint256 endTime = currentTime + duration;
@@ -713,7 +785,8 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         emit NewUpkeepPeriod(latestPeriodNumber, currentTime + 1, endTime, cakePerSecond);
     }
 
-    /// @notice Update cake reward for all the liquidity mining pool.
+    /// @notice 更新所有池的 LMPool 累计奖励到当前时间。
+    /// @dev 池子较多时 gas 可能较高，一般用于关键参数变更前后的一次全量同步。
     function massUpdatePools() internal {
         uint32 currentTime = uint32(block.timestamp);
         for (uint256 pid = 1; pid <= poolLength; pid++) {
@@ -725,8 +798,7 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         }
     }
 
-    /// @notice Update cake reward for the liquidity mining pool.
-    /// @dev Avoid too many pools, and a single transaction cannot be fully executed for all pools.
+    /// @notice 按 pid 列表批量更新池奖励（分批替代全量更新，节省 gas）。
     function updatePools(uint256[] calldata pids) external onlyOwnerOrOperator {
         uint32 currentTime = uint32(block.timestamp);
         for (uint256 i = 0; i < pids.length; i++) {
@@ -738,58 +810,57 @@ contract MasterChefV3 is INonfungiblePositionManagerStruct, Multicall, Ownable, 
         }
     }
 
-    /// @notice Set global cakePerSecond.
-    /// @dev Callable by owner
-    /// @param _globalCakePerSecond New cakePerSecond.
+    /// @notice 设置全局每秒排放。
+    /// @dev 仅 owner 可调用。
+    /// @param _globalCakePerSecond 新的每秒排放值。
     function setGlobalCakePerSecond(uint256 _globalCakePerSecond) external onlyOwner {
         globalCakePerSecond = _globalCakePerSecond;
         emit NewCakePerSecond(_globalCakePerSecond);
     }
 
-    /// @notice Set operator address.
-    /// @dev Callable by owner
-    /// @param _operatorAddress New operator address.
+    /// @notice 设置 operator 地址。
+    /// @dev 仅 owner 可调用。
+    /// @param _operatorAddress 新 operator 地址。
     function setOperator(address _operatorAddress) external onlyOwner {
         if (_operatorAddress == address(0)) revert ZeroAddress();
         operatorAddress = _operatorAddress;
         emit NewOperatorAddress(_operatorAddress);
     }
 
-    /// @notice Set period duration.
-    /// @dev Callable by owner
-    /// @param _periodDuration New period duration.
+    /// @notice 设置默认周期时长。
+    /// @dev 仅 owner 可调用。
+    /// @param _periodDuration 新周期时长。
     function setPeriodDuration(uint256 _periodDuration) external onlyOwner {
         if (_periodDuration < MIN_DURATION || _periodDuration > MAX_DURATION) revert InvalidPeriodDuration();
         PERIOD_DURATION = _periodDuration;
         emit NewPeriodDuration(_periodDuration);
     }
     
-    /// @notice Update farm boost contract address.
-    /// @param _newFarmBoostContract The new farm booster address.
+    /// @notice 更新 farm boost 合约地址。
+    /// @param _newFarmBoostContract 新 farm booster 地址。
     function updateFarmBoostContract(address _newFarmBoostContract) external onlyOwner {
-        // farm booster can be zero address when need to remove farm booster
+        // 允许设置为零地址，用于移除 booster 功能。
         FARM_BOOSTER = IFarmBooster(_newFarmBoostContract);
         emit UpdateFarmBoostContract(_newFarmBoostContract);
     }
 
-    /**
-     * @notice Transfer ETH in a safe way
-     * @param to: address to transfer ETH to
-     * @param value: ETH amount to transfer (in wei)
-     */
+    /// @notice 安全转 ETH。
+    /// @param to 接收 ETH 的地址。
+    /// @param value 转账金额（wei）。
     function safeTransferETH(address to, uint256 value) internal {
         (bool success, ) = to.call{value: value}("");
         if (!success) revert();
     }
 
-    /// @notice Safe Transfer rewards.
-    /// @param _to The rewards receiver address.
-    /// @param _amount Transfer rewards amounts.
-    /// @param _amount pid pool.
+    /// @notice 安全发放奖励：按池配置比例 mint 多奖励代币给用户。
+    /// @param _to 奖励接收地址。
+    /// @param _amount 本次应发总奖励量。
+    /// @param _pid 池子 pid。
     function _safeTransfer(address _to, uint256 _amount, uint256 _pid) internal {
         if (_amount > 0) {
             (uint256[] memory rewardsRatio, address[] memory rewardsAddresses) = getRewardsRatioInfoByPid(_pid);
             for (uint256 i = 0; i < rewardsRatio.length; i++) {
+                // 示例：_amount=100，ratio=8000，则发 80。
                 uint256 rewardsAmount =  (rewardsRatio[i] * _amount) / REWARDS_PRECISION;
                 require(
                     IERC20Mintable(rewardsAddresses[i]).mint(address(_to), rewardsAmount),
